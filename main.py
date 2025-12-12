@@ -13,16 +13,15 @@ from aiogram.exceptions import TelegramBadRequest
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("BOT_TOKEN")
-# Получаем ID админов и чистим от пробелов
-raw_admins = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x) for x in raw_admins.split(",") if x.strip().isdigit()]
+# Используем одиночную переменную ADMIN_ID, как ты просил
+ADMIN_ID_STR = os.getenv("ADMIN_ID")
+ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
 
 DB_NAME = "bot_database.db"
 
 # --- СОСТОЯНИЯ (FSM) ---
 class UserState(StatesGroup):
-    waiting_for_number = State() # Ждем номер от юзера
-    waiting_for_code = State()   # Ждем код (если нужно)
+    waiting_for_number = State()
 
 class AdminState(StatesGroup):
     waiting_for_broadcast = State()
@@ -41,7 +40,7 @@ async def init_db():
         )""")
         
         # Таблица номеров
-        # status: 'queue' (очередь), 'work' (в работе), 'finished' (выплата), 'dead' (слет)
+        # worker_msg_id: ID сообщения воркера, чтобы его редактировать
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -49,6 +48,7 @@ async def init_db():
             status TEXT,
             start_time TIMESTAMP,
             end_time TIMESTAMP,
+            worker_msg_id INTEGER, 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
@@ -85,11 +85,17 @@ def back_to_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def tariff_kb():
-    # Как на скриншоте
     kb = [
         [InlineKeyboardButton(text="✅ Обычный код", callback_data="tariff_sms"), 
          InlineKeyboardButton(text="QR-код", callback_data="tariff_qr")],
         [InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def worker_control_kb(num_id):
+    kb = [
+        [InlineKeyboardButton(text="💀 Слет", callback_data=f"w_dead_{num_id}"),
+         InlineKeyboardButton(text="💰 Выплата", callback_data=f"w_finish_{num_id}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -101,7 +107,8 @@ def admin_kb():
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- ЛОГИКА ПОЛЬЗОВАТЕЛЯ ---
+
+# --- ЛОГИКА ПОЛЬЗОВАТЕЛЯ И НАВИГАЦИЯ ---
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -123,7 +130,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=main_menu_kb()
     )
 
-# Обработка кнопки "Назад" или "Отмена" (возврат в меню)
 @router.callback_query(F.data == "nav_main")
 async def nav_main(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -133,6 +139,8 @@ async def nav_main(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
 
+# ... (Остальные функции профиля, отчетов и инструкции остаются без изменений) ...
+
 # --- РАЗДЕЛ ПРОФИЛЬ (КАК НА СКРИНЕ) ---
 @router.callback_query(F.data == "menu_profile")
 async def show_profile(callback: CallbackQuery):
@@ -141,17 +149,14 @@ async def show_profile(callback: CallbackQuery):
     username = f"@{callback.from_user.username}" if callback.from_user.username else "Не указан"
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Всего сдал (finished + dead) или только finished? Обычно считают успешные.
-        # Пусть считается все, что не в очереди и не в работе.
+        today_start = datetime.combine(date.today(), datetime.min.time()).isoformat()
         
-        # Считаем за сегодня
         async with db.execute("""
             SELECT COUNT(*) FROM numbers 
-            WHERE user_id = ? AND created_at >= date('now', 'start of day')
-        """, (user_id,)) as cursor:
+            WHERE user_id = ? AND created_at >= ?
+        """, (user_id, today_start)) as cursor:
             today_count = (await cursor.fetchone())[0]
 
-        # Считаем всего
         async with db.execute("SELECT COUNT(*) FROM numbers WHERE user_id = ?", (user_id,)) as cursor:
             total_count = (await cursor.fetchone())[0]
 
@@ -196,11 +201,9 @@ async def show_reports(callback: CallbackQuery):
             
         report_text += f"📱 `{phone}`\n⏳ {duration} | {status_icon}\n\n"
 
-    # Отправляем новым сообщением, чтобы не ломать структуру меню
     await callback.message.answer(report_text, parse_mode="Markdown")
     await callback.answer()
 
-# --- РАЗДЕЛ ИНСТРУКЦИЯ (КАК НА СКРИНЕ) ---
 @router.callback_query(F.data == "menu_guide")
 async def show_guide(callback: CallbackQuery):
     text = (
@@ -214,6 +217,7 @@ async def show_guide(callback: CallbackQuery):
         "6) Ждёте слёта и выплаты под конец дня."
     )
     await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
+
 
 # --- СДАЧА НОМЕРА ---
 @router.callback_query(F.data == "menu_send_number")
@@ -240,19 +244,20 @@ async def ask_phone_input(callback: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_for_number)
 async def receive_number(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    # Простая проверка на KZ номера
-    if not text.startswith("+77"):
+    
+    # Более надежный парсинг номеров (убираем лишние символы и проверяем на +77)
+    raw_phones = [p.strip() for p in text.split(',')]
+    valid_phones = [p for p in raw_phones if p.startswith("+77") and p[1:].isdigit()]
+    
+    if not valid_phones:
         await message.answer(
-            "❌ **Ошибка!** Принимаются только номера Казахстана (+77...).\nПопробуй еще раз.",
+            "❌ **Ошибка!** Принимаются только номера Казахстана (+77...) в правильном формате.\nПопробуй еще раз.",
             reply_markup=cancel_kb(), parse_mode="Markdown"
         )
         return
 
-    # Разбиваем по запятым, если несколько
-    phones = [p.strip() for p in text.split(',')]
-    
     async with aiosqlite.connect(DB_NAME) as db:
-        for phone in phones:
+        for phone in valid_phones:
             await db.execute(
                 "INSERT INTO numbers (user_id, phone, status) VALUES (?, ?, ?)", 
                 (message.from_user.id, phone, 'queue')
@@ -260,7 +265,7 @@ async def receive_number(message: types.Message, state: FSMContext):
         await db.commit()
 
     await message.answer(
-        f"✅ **Принято номеров: {len(phones)}**\n"
+        f"✅ **Принято номеров: {len(valid_phones)}**\n"
         "Ожидайте очереди. Когда бот запросит код, вам придет уведомление.",
         reply_markup=main_menu_kb(), parse_mode="Markdown"
     )
@@ -270,7 +275,6 @@ async def receive_number(message: types.Message, state: FSMContext):
 
 @router.message(Command("startwork"))
 async def worker_setup(message: types.Message):
-    # Работает только в группах
     if message.chat.type not in ['group', 'supergroup']:
         return
 
@@ -288,7 +292,6 @@ async def worker_setup(message: types.Message):
 @router.message(Command("num"))
 async def worker_get_num(message: types.Message, bot: Bot):
     async with aiosqlite.connect(DB_NAME) as db:
-        # Берем из очереди (статус queue)
         async with db.execute("SELECT id, user_id, phone FROM numbers WHERE status = 'queue' ORDER BY id ASC LIMIT 1") as cursor:
             row = await cursor.fetchone()
         
@@ -299,21 +302,21 @@ async def worker_get_num(message: types.Message, bot: Bot):
         row_id, user_id, phone = row
         start_time = datetime.now().isoformat()
         
-        # Ставим статус work
+        # Обновляем статус, но пока без worker_msg_id, он придет позже
         await db.execute("UPDATE numbers SET status = 'work', start_time = ? WHERE id = ?", (start_time, row_id))
         await db.commit()
 
-    # Кнопки управления номером для воркера
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💀 Слет", callback_data=f"w_dead_{row_id}"),
-         InlineKeyboardButton(text="💰 Выплата", callback_data=f"w_finish_{row_id}")]
-    ])
-    
-    await message.answer(
+    # Отправляем сообщение воркеру
+    work_message = await message.answer(
         f"🔧 **В Работе**\n📱 `{phone}`\n🆔 User: `{user_id}`\n\nКоманды:\n`/sms {phone} Текст`",
         parse_mode="Markdown",
-        reply_markup=kb
+        reply_markup=worker_control_kb(row_id)
     )
+    
+    # Сохраняем ID сообщения воркера для дальнейшего редактирования
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE numbers SET worker_msg_id = ? WHERE id = ?", (work_message.message_id, row_id))
+        await db.commit()
     
     # Уведомляем юзера
     try:
@@ -334,89 +337,120 @@ async def worker_sms(message: types.Message, command: CommandObject, bot: Bot):
     phone, text = args[0], args[1]
     
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM numbers WHERE phone = ? AND status = 'work'", (phone,)) as cursor:
+        async with db.execute("SELECT user_id, worker_msg_id FROM numbers WHERE phone = ? AND status = 'work'", (phone,)) as cursor:
             row = await cursor.fetchone()
             
     if not row:
-        await message.answer("❌ Номер не в работе.")
+        await message.answer(f"❌ Номер `{phone}` не в активной работе.")
         return
         
-    user_id = row[0]
+    user_id, worker_msg_id = row
+    
+    # Уведомляем юзера
     try:
+        # Отправляем сообщение, на которое юзер должен ответить
         await bot.send_message(
             user_id, 
             f"🔔 **КОД!**\nДля номера: `{phone}`\n\n📝 Сообщение: **{text}**\n\n👇 Ответь на это сообщение кодом или фото!",
             parse_mode="Markdown"
         )
-        await message.answer("📨 Запрос отправлен.")
+        # Отправляем подтверждение воркеру в рабочую тему
+        await message.answer(f"📨 Запрос кода отправлен юзеру для `{phone}`.")
     except Exception as e:
-        await message.answer(f"❌ Ошибка отправки: {e}")
+        await message.answer(f"❌ Ошибка отправки юзеру: {e}")
 
 # Пересылка ответа юзера воркеру
 @router.message(F.reply_to_message)
 async def forward_reply(message: types.Message, bot: Bot):
-    if message.chat.type != 'private': return # Только ЛС с ботом
+    if message.chat.type != 'private': return
     
-    # Ищем, какой воркер чат активен
+    user_id = message.from_user.id
+    
     async with aiosqlite.connect(DB_NAME) as db:
+        # Ищем активный номер, который дал этот юзер
+        async with db.execute("SELECT phone FROM numbers WHERE user_id = ? AND status = 'work'", (user_id,)) as c:
+            num_row = await c.fetchone()
+            
+        # Получаем данные рабочего чата
         async with db.execute("SELECT value FROM config WHERE key='work_chat_id'") as c:
             chat_res = await c.fetchone()
         async with db.execute("SELECT value FROM config WHERE key='work_thread_id'") as c:
             thread_res = await c.fetchone()
             
-    if chat_res:
+    if chat_res and num_row:
         chat_id = int(chat_res[0])
         thread_id = int(thread_res[0]) if thread_res else None
+        phone = num_row[0]
         
+        # Отправляем уведомление с номером
         await bot.send_message(
             chat_id=chat_id,
             message_thread_id=thread_id,
-            text=f"📩 **ОТВЕТ ОТ ЮЗЕРА**\nID: {message.from_user.id}\nТекст: {message.text or 'Фото/Медиа'}"
+            text=f"📩 **КОД ОТ ЮЗЕРА**\n📱 Номер: `{phone}`\nID: {user_id}",
+            parse_mode="Markdown"
         )
-        if message.photo:
-            await bot.send_photo(chat_id=chat_id, message_thread_id=thread_id, photo=message.photo[-1].file_id)
-        
-        await message.answer("✅ Отправлено воркеру.")
+        # Пересылаем сам ответ (текст/фото)
+        await message.forward(chat_id=chat_id, message_thread_id=thread_id)
+        await message.answer("✅ Код передан специалистам.")
 
 # Обработка кнопок воркера (Слет/Выплата)
 @router.callback_query(F.data.startswith("w_"))
-async def worker_action(callback: CallbackQuery):
+async def worker_action(callback: CallbackQuery, bot: Bot):
+    if callback.message.chat.type not in ['group', 'supergroup']:
+        await callback.answer("Эта кнопка работает только в рабочей группе.")
+        return
+        
     action, num_id = callback.data.split('_')[1], callback.data.split('_')[2]
     status = 'finished' if action == 'finish' else 'dead'
     res_text = "✅ ВЫПЛАТА" if action == 'finish' else "💀 СЛЕТ"
     
     async with aiosqlite.connect(DB_NAME) as db:
+        # Получаем данные
+        async with db.execute("SELECT phone, start_time, user_id FROM numbers WHERE id = ?", (num_id,)) as c:
+            row = await c.fetchone()
+        
+        if not row:
+            await callback.answer("Номер уже закрыт или не существует.")
+            return
+
+        phone, start_str, user_id = row
+        end_time = datetime.now()
+        
+        # Обновляем БД
         await db.execute(
             "UPDATE numbers SET status = ?, end_time = ? WHERE id = ?", 
-            (status, datetime.now().isoformat(), num_id)
+            (status, end_time.isoformat(), num_id)
         )
         await db.commit()
-        
-        # Получаем данные для отчета
-        async with db.execute("SELECT phone, start_time FROM numbers WHERE id=?", (num_id,)) as c:
-            row = await c.fetchone()
             
-    if row:
-        phone, start_str = row
-        start = datetime.fromisoformat(start_str)
-        duration = str(datetime.now() - start).split('.')[0]
-        
-        await callback.message.edit_text(
-            f"🏁 **ЗАВЕРШЕНО**\n📱 `{phone}`\n⏱ {duration}\nИтог: {res_text}",
-            parse_mode="Markdown"
-        )
+    start_dt = datetime.fromisoformat(start_str)
+    duration = str(end_time - start_dt).split('.')[0]
+    
+    # Редактируем сообщение воркера
+    await callback.message.edit_text(
+        f"🏁 **ЗАВЕРШЕНО**\n📱 `{phone}`\n⏱ Работал: {duration}\nИтог: {res_text}\nЗакрыл: {callback.from_user.full_name}",
+        parse_mode="Markdown",
+        reply_markup=None
+    )
+    
+    # Уведомляем юзера
+    try:
+        await bot.send_message(user_id, f"✅ Твой номер `{phone}` завершил работу! Статус: **{res_text}**.", parse_mode="Markdown")
+    except: pass
+    
+    await callback.answer(f"Статус обновлен: {res_text}", show_alert=True)
+
 
 # --- АДМИН ПАНЕЛЬ ---
 @router.message(Command("admin"))
 async def open_admin(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        # Для отладки, если не работает
-        print(f"Попытка входа в админку: {message.from_user.id} (Не в списке {ADMIN_IDS})") 
+    if message.from_user.id != ADMIN_ID:
         return
     await message.answer("🔧 Админ панель:", reply_markup=admin_kb())
 
 @router.callback_query(F.data == "admin_clear_queue")
 async def admin_clear(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM numbers WHERE status = 'queue'")
         await db.commit()
@@ -424,12 +458,15 @@ async def admin_clear(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_br_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
     await callback.message.answer("✍️ Введи текст рассылки:")
     await state.set_state(AdminState.waiting_for_broadcast)
     await callback.answer()
 
 @router.message(AdminState.waiting_for_broadcast)
 async def admin_br_send(message: types.Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != ADMIN_ID: return
+    
     count = 0
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
@@ -439,20 +476,25 @@ async def admin_br_send(message: types.Message, state: FSMContext, bot: Bot):
                     count += 1
                     await asyncio.sleep(0.05)
                 except: pass
+                
     await message.answer(f"Разослано: {count}")
     await state.clear()
 
 @router.callback_query(F.data == "admin_close")
 async def admin_close(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
     await callback.message.delete()
 
 # --- MAIN ---
 async def main():
     print(f"Запуск бота...")
-    print(f"Загруженные Admin IDs: {ADMIN_IDS}") # Чтобы ты проверил в логах
+    print(f"Загруженный Admin ID: {ADMIN_ID}")
 
     if not TOKEN:
         print("ОШИБКА: Нет токена!")
+        return
+    if not ADMIN_ID:
+        print("ОШИБКА: ADMIN_ID не установлен или не является числом!")
         return
 
     await init_db()
