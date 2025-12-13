@@ -15,7 +15,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "bot_v8_final.db"
+DB_NAME = "bot_v9_ultra.db"
 
 # Логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -76,13 +76,11 @@ async def main_menu_kb(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def tariff_select_kb():
-    # IMG_2246 (низ)
     kb = [[InlineKeyboardButton(text="Холд (30+ мин -> $9)", callback_data="method_select")],
           [InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def method_select_kb():
-    # IMG_2246 (верх)
     kb = [[InlineKeyboardButton(text="✅ Обычный код", callback_data="input_sms"), 
            InlineKeyboardButton(text="QR-код", callback_data="input_qr")],
           [InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]]
@@ -92,7 +90,6 @@ def cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]])
 
 def back_to_main_kb():
-    # IMG_2248
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="nav_main")]])
 
 def profile_kb():
@@ -134,7 +131,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await db.commit()
     
-    # Текст как на IMG_2245
     text = (
         "🤖 **Бот для приема номеров**\n\n"
         "💎 Доступные тарифные планы:\n"
@@ -162,7 +158,6 @@ async def nav_main(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "menu_guide")
 async def show_guide(callback: CallbackQuery):
-    # Текст как на IMG_2248
     text = (
         "📖 **Как сдать свой номер:**\n\n"
         "1) Нажми \"📥 Сдать номер\".\n\n"
@@ -228,7 +223,6 @@ async def show_reports(callback: CallbackQuery):
     report_text = "📄 **Последние 5 номеров:**\n\n"
     for row in rows:
         phone, start_str, end_str, status = row
-        # finished = Слет (Успех), dead = Ошибка
         status_text = "📉 Слет" if status == 'finished' else "❌ Ошибка"
         
         duration = "—"
@@ -254,7 +248,6 @@ async def step_tariff(callback: CallbackQuery):
 
 @router.callback_query(F.data == "method_select")
 async def step_method(callback: CallbackQuery):
-    # IMG_2246 (текст)
     text = (
         "✅ Выбран тариф: Холд\n\n"
         "📝 Чтобы сдать номер(а) — отправь их одним сообщением.\n"
@@ -271,14 +264,12 @@ async def step_input(callback: CallbackQuery, state: FSMContext):
     method = 'sms' if callback.data == "input_sms" else 'qr'
     await state.update_data(method=method)
 
-    # Проверка на активный номер
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT phone FROM numbers WHERE user_id = ? AND status IN ('work', 'active')", (callback.from_user.id,)) as c:
              if await c.fetchone():
                  await callback.answer("У вас уже есть номер в работе!", show_alert=True)
                  return
     
-    # IMG_2267 (ввод номера)
     await callback.message.edit_text(
         "✏️ **Введите номер(а):**\n\n"
         "Ожидаю ввод в формате `+77...`",
@@ -317,7 +308,6 @@ async def receive_number(message: types.Message, state: FSMContext):
         await db.commit()
 
     type_icon = "QR-код" if method == 'qr' else "✉️ SMS"
-    # IMG_2267 (Успешно)
     await message.answer(
         f"✅ **Успешно!**\n"
         f"📥 Принято номеров: **{len(valid_phones)}**\n"
@@ -344,7 +334,6 @@ async def worker_setup(message: types.Message):
                 await db.execute("DELETE FROM config WHERE key='work_thread_id'")
             await db.commit()
             
-        # ТУТОРИАЛ (ИСПРАВЛЕННЫЙ)
         tutorial = (
             "✅ **Чат привязан!**\n\n"
             "👨‍💻 **Гайд по использованию:**\n\n"
@@ -374,18 +363,14 @@ async def worker_get_num(message: types.Message, bot: Bot):
             return
 
         row_id, user_id, phone, method = row
-        method_str = "QR-КОД" if method == 'qr' else "Обычный код"
         
         await db.execute("UPDATE numbers SET status = 'work', start_time = ? WHERE id = ?", (datetime.now().isoformat(), row_id))
         await db.commit()
 
+    # --- МИНИМАЛИСТИЧНЫЙ ВИД ДЛЯ ВОРКЕРА ---
     work_message = await message.answer(
-        f"🔧 **Новая заявка**\n"
-        f"📱 `{phone}`\n"
-        f"📌 Тип: **{method_str}**\n"
-        f"🆔 User: `{user_id}`\n\n"
-        f"📸 **Скинь ЮЗЕРУ код/QR:**\n"
-        f"Фото + `/sms {phone} текст`",
+        f"📱 `{phone}`\n\n"
+        f"`/sms {phone} текст`",
         parse_mode="Markdown",
         reply_markup=worker_stage1_kb(row_id)
     )
@@ -398,25 +383,33 @@ async def worker_get_num(message: types.Message, bot: Bot):
         await bot.send_message(user_id, f"⚡️ Ваш номер `{phone}` принят в работу! Ожидайте код.", parse_mode="Markdown")
     except: pass
 
-# --- ОБРАБОТКА ФОТО ОТ ВОРКЕРА ---
+# --- ИСПРАВЛЕННАЯ ОБРАБОТКА ФОТО (v9.0) ---
 
-@router.message(Command("sms"))
-async def worker_sms_text(message: types.Message, command: CommandObject, bot: Bot):
-    if not command.args: return
-    try: phone, text = command.args.split(' ', 1)
-    except: return
-    await process_worker_response(message, bot, phone, text, is_photo=False)
-
+# 1. Сначала ловим ФОТО с подписью
 @router.message(F.photo & F.caption.startswith("/sms"))
 async def worker_sms_photo(message: types.Message, bot: Bot):
     try:
+        # Парсим команду: /sms +77... текст
         args_raw = message.caption[4:].strip() 
         phone, text = args_raw.split(' ', 1)
     except:
-        await message.reply("⚠️ Формат: Фото + подпись `/sms +77... Текст`", parse_mode="Markdown")
+        await message.reply("⚠️ Ошибка. Формат: Фото + `/sms +77... Текст`", parse_mode="Markdown")
         return
+    
+    # Передаем True, так как это фото
     await process_worker_response(message, bot, phone, text, is_photo=True)
 
+# 2. Ловим ТЕКСТ (если фото нет)
+@router.message(Command("sms"))
+async def worker_sms_text(message: types.Message, command: CommandObject, bot: Bot):
+    # Если это сработало, значит фото НЕТ (иначе сработал бы хендлер выше)
+    if not command.args: return
+    try: phone, text = command.args.split(' ', 1)
+    except: return
+    
+    await process_worker_response(message, bot, phone, text, is_photo=False)
+
+# Универсальная функция отправки
 async def process_worker_response(message, bot, phone, text, is_photo):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id, method FROM numbers WHERE phone = ? AND status IN ('work', 'active')", (phone,)) as c:
@@ -425,7 +418,7 @@ async def process_worker_response(message, bot, phone, text, is_photo):
     if row:
         user_id, method = row
         try:
-            # Текст для пользователя
+            # Красивый текст для юзера
             caption_text = (
                 f"🔔 **ВНИМАНИЕ!**\n"
                 f"📱 Номер: `{phone}`\n"
@@ -434,16 +427,21 @@ async def process_worker_response(message, bot, phone, text, is_photo):
             )
             
             if is_photo:
-                photo_id = message.photo[-1].file_id
-                await bot.send_photo(user_id, photo=photo_id, caption=caption_text, parse_mode="Markdown")
+                # ВАЖНО: Берем ID самой большой версии картинки
+                photo_file_id = message.photo[-1].file_id
+                # Отправляем именно send_photo
+                await bot.send_photo(chat_id=user_id, photo=photo_file_id, caption=caption_text, parse_mode="Markdown")
             else:
-                await bot.send_message(user_id, caption_text, parse_mode="Markdown")
+                # Просто текст
+                await bot.send_message(chat_id=user_id, text=caption_text, parse_mode="Markdown")
                 
+            # Ставим реакцию воркеру, что все ок
             await message.react([types.ReactionTypeEmoji(emoji="👍")])
+            
         except Exception as e:
-            await message.reply(f"❌ Не доставлено: {e}")
+            await message.reply(f"❌ Ошибка отправки юзеру (блок?): {e}")
     else:
-        await message.reply(f"❌ Номер `{phone}` не в работе.")
+        await message.reply(f"❌ Номер `{phone}` не найден в активной работе.")
 
 @router.message(F.reply_to_message)
 async def forward_reply(message: types.Message, bot: Bot):
@@ -481,7 +479,7 @@ async def worker_action(callback: CallbackQuery, bot: Bot):
             await db.commit()
             
             await callback.message.edit_text(
-                f"🟢 **АКТИВЕН (ВСТАЛ)**\n📱 `{phone}`\n⏳ Таймер идет...",
+                f"🟢 **АКТИВЕН**\n📱 `{phone}`",
                 reply_markup=worker_stage2_kb(num_id),
                 parse_mode="Markdown"
             )
@@ -504,14 +502,12 @@ async def worker_action(callback: CallbackQuery, bot: Bot):
             diff = datetime.now() - start_dt
             hours, remainder = divmod(diff.seconds, 3600)
             minutes, _ = divmod(remainder, 60)
-            # Просто время без текста
             duration_str = f"{hours}ч {minutes}мин"
             
             await callback.message.edit_text(
                 f"📉 **СЛЕТ**\n"
                 f"📱 `{phone}`\n"
-                f"⏱ **{duration_str}**\n"
-                f"👤 Воркер: {callback.from_user.first_name}",
+                f"⏱ **{duration_str}**",
                 parse_mode="Markdown"
             )
             try: await bot.send_message(user_id, f"📉 Номер `{phone}` завершил работу (Слет).\n⏱ {duration_str}", parse_mode="Markdown")
@@ -561,7 +557,7 @@ async def admin_close(callback: CallbackQuery):
 
 # --- ЗАПУСК ---
 async def main():
-    print("Бот v8.0 (Final Cut) запускается...")
+    print("Бот v9.0 (Ultra) запускается...")
     if not TOKEN or not ADMIN_ID:
         print("❌ ОШИБКА: Заполни BOT_TOKEN и ADMIN_ID")
         return
