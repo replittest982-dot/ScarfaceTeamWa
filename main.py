@@ -4,7 +4,7 @@ import sys
 import os
 import re
 import json
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date # <--- Добавил date
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command, CommandStart, CommandObject
@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v10.db"
+DB_NAME = "fast_team_v10_1.db" # Обновил имя базы
 
 # Часовой пояс (МСК = UTC+3)
 MSK_OFFSET = 3 
@@ -34,8 +34,8 @@ class AdminState(StatesGroup):
     waiting_for_broadcast = State()
     setting_schedule_start = State()
     setting_schedule_end = State()
-    adding_tariff_name = State()
-    adding_tariff_price = State()
+    # Для добавления тарифов (заглушка на будущее)
+    adding_tariff_name = State() 
 
 # --- БАЗА ДАННЫХ И НАСТРОЙКИ ---
 async def init_db():
@@ -47,7 +47,7 @@ async def init_db():
             reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
-        # Добавили tariff_name и tariff_price для фиксации цены
+        # Добавили worker_id для защиты кнопок
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -56,6 +56,7 @@ async def init_db():
             tariff_name TEXT,
             tariff_price TEXT,
             status TEXT, 
+            worker_id INTEGER, 
             start_time TIMESTAMP,
             end_time TIMESTAMP,
             worker_msg_id INTEGER, 
@@ -67,15 +68,18 @@ async def init_db():
             value TEXT
         )""")
         
-        # Дефолтные настройки, если их нет
-        # Тарифы
+        # Миграция для старых баз (если база была создана ранее)
+        try: await db.execute("ALTER TABLE numbers ADD COLUMN worker_id INTEGER")
+        except: pass
+        
+        # Дефолтные настройки
         default_tariffs = {
             "ВЦ RU": "4$ Час",
             "MAX ФБХ": "3.5$ / 0 минут"
         }
-        await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('tariffs', ?)", (json.dumps(default_tariffs),))
+        # Сохраняем тарифы с поддержкой unicode
+        await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('tariffs', ?)", (json.dumps(default_tariffs, ensure_ascii=False),))
         
-        # Время работы (07:00 - 17:30)
         await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('work_start', '07:00')")
         await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('work_end', '17:30')")
         
@@ -87,9 +91,7 @@ def get_msk_time():
     return datetime.utcnow() + timedelta(hours=MSK_OFFSET)
 
 async def check_work_hours():
-    """Проверяет, рабочее ли сейчас время по МСК"""
     now_msk = get_msk_time().time()
-    
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key='work_start'") as c:
             start_str = (await c.fetchone())[0]
@@ -99,29 +101,19 @@ async def check_work_hours():
     start_time = datetime.strptime(start_str, "%H:%M").time()
     end_time = datetime.strptime(end_str, "%H:%M").time()
     
-    # Простая проверка (без перехода через полночь)
     if start_time <= end_time:
         return start_time <= now_msk <= end_time
     else:
-        # Если смена через ночь (например 22:00 - 06:00)
         return start_time <= now_msk or now_msk <= end_time
 
 def clean_phone(phone: str):
-    """Очистка и валидация номера"""
-    # Убираем все кроме цифр и плюса
     clean = re.sub(r'[^\d+]', '', phone)
-    
-    # Если начинается с 8 и длина 11 (РФ/КЗ формат 8705...), меняем 8 на +7
     if clean.startswith('8') and len(clean) == 11:
         clean = '+7' + clean[1:]
-    # Если начинается с 7 и длина 11, добавляем +
     elif clean.startswith('7') and len(clean) == 11:
         clean = '+' + clean
-    # Если просто куча цифр (10 шт), считаем что это +7...
     elif len(clean) == 10 and clean.isdigit():
         clean = '+7' + clean
-        
-    # Финальная проверка: должен начинаться с + и иметь от 10 до 15 цифр
     if not re.match(r'^\+\d{10,15}$', clean):
         return None
     return clean
@@ -159,26 +151,22 @@ def method_select_kb():
 def cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]])
 
-# Воркер: Главная кнопка "Взять номер"
 def worker_take_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 ВЗЯТЬ ЗАЯВКУ", callback_data="worker_take_new")]
     ])
 
-# Воркер: Активная работа
 def worker_active_kb(num_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Встал", callback_data=f"w_active_{num_id}"),
          InlineKeyboardButton(text="❌ Ошибка/Спам", callback_data=f"w_error_{num_id}")]
     ])
 
-# Воркер: Финал (Только Слет)
 def worker_finish_kb(num_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_dead_{num_id}")]
     ])
 
-# Админка
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 Скачать отчет (.txt)", callback_data="adm_report")],
@@ -216,7 +204,6 @@ async def nav_main(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "select_tariff")
 async def step_tariff(callback: CallbackQuery):
-    # Проверка времени работы
     if not await check_work_hours():
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT value FROM config WHERE key='work_start'") as c: s = (await c.fetchone())[0]
@@ -230,7 +217,6 @@ async def step_tariff(callback: CallbackQuery):
 async def step_method(callback: CallbackQuery, state: FSMContext):
     tariff_name = callback.data.split('_')[1]
     
-    # Получаем цену из конфига для сохранения
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key='tariffs'") as c:
             tariffs = json.loads((await c.fetchone())[0])
@@ -249,7 +235,6 @@ async def step_input(callback: CallbackQuery, state: FSMContext):
     method = 'sms' if callback.data == "input_sms" else 'qr'
     await state.update_data(method=method)
 
-    # Проверка на дурака (уже есть активный номер)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT phone FROM numbers WHERE user_id = ? AND status IN ('queue', 'work', 'active')", (callback.from_user.id,)) as c:
              if await c.fetchone():
@@ -281,13 +266,12 @@ async def receive_number(message: types.Message, state: FSMContext):
         for p in phones_raw:
             cleaned = clean_phone(p)
             if cleaned:
-                # Проверка дублей
                 async with db.execute("SELECT 1 FROM numbers WHERE phone = ? AND status IN ('queue', 'work', 'active')", (cleaned,)) as c:
                     if not await c.fetchone():
                         valid_phones.append(cleaned)
     
     if not valid_phones:
-        await message.answer("❌ **Ошибка!** Номер некорректен или уже в работе.\nПроверьте формат (минимум 10 цифр).", reply_markup=cancel_kb(), parse_mode="Markdown")
+        await message.answer("❌ **Ошибка!** Номер некорректен или уже в работе.", reply_markup=cancel_kb(), parse_mode="Markdown")
         return
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -307,7 +291,7 @@ async def receive_number(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
-# --- ВОРКЕР ПАНЕЛЬ (БЕЗ КОМАНД, ТОЛЬКО КНОПКИ) ---
+# --- ВОРКЕР ПАНЕЛЬ ---
 
 @router.message(Command("startwork"))
 async def worker_setup(message: types.Message):
@@ -332,7 +316,8 @@ async def worker_setup(message: types.Message):
 
 @router.callback_query(F.data == "worker_take_new")
 async def worker_take_job(callback: CallbackQuery, bot: Bot):
-    # Проверка чата
+    worker_id = callback.from_user.id # Запоминаем кто нажал
+    
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key='work_chat_id'") as c:
             res = await c.fetchone()
@@ -349,29 +334,27 @@ async def worker_take_job(callback: CallbackQuery, bot: Bot):
             return
 
         row_id, user_id, phone, method, tariff = row
-        method_str = "📸 QR-КОД" if method == 'qr' else "✉️ SMS-КОД"
+        method_str = "📷 QR-КОД" if method == 'qr' else "✉️ SMS-КОД"
         
-        # Обновляем статус
-        await db.execute("UPDATE numbers SET status = 'work', start_time = ? WHERE id = ?", (datetime.utcnow().isoformat(), row_id))
+        # Обновляем статус И ЗАПИСЫВАЕМ WORKER_ID
+        await db.execute("UPDATE numbers SET status = 'work', worker_id = ?, start_time = ? WHERE id = ?", (worker_id, datetime.utcnow().isoformat(), row_id))
         await db.commit()
 
-    # Меняем сообщение с кнопкой на панель работы
     text = (
         f"🔧 **В РАБОТЕ**\n"
         f"📱 `{phone}`\n"
         f"📌 Тип: **{method_str}** | Тариф: {tariff}\n"
+        f"👤 Воркер: {callback.from_user.first_name}\n"
         f"👇 **Копируй команду:**\n\n"
         f"`/sms {phone} текст`"
     )
     
-    # Сохраняем ID сообщения чтобы потом редактировать
     work_msg = await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=worker_active_kb(row_id))
     
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE numbers SET worker_msg_id = ? WHERE id = ?", (work_msg.message_id, row_id))
         await db.commit()
 
-    # Уведомляем юзера
     try: await bot.send_message(user_id, f"⚡️ Ваш номер `{phone}` взят в работу! Ожидайте.", parse_mode="Markdown")
     except: pass
 
@@ -381,13 +364,18 @@ async def worker_logic(callback: CallbackQuery, bot: Bot):
     action, num_id = parts[1], parts[2]
     
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT phone, start_time, user_id FROM numbers WHERE id = ?", (num_id,)) as c:
+        async with db.execute("SELECT phone, start_time, user_id, worker_id FROM numbers WHERE id = ?", (num_id,)) as c:
             row = await c.fetchone()
         if not row: 
             await callback.answer("Заявка не найдена.")
             return
         
-        phone, start_str, user_id = row
+        phone, start_str, user_id, worker_id = row
+
+        # ЗАЩИТА: Проверяем, тот ли это воркер
+        if worker_id != callback.from_user.id:
+            await callback.answer("🚫 Это не ваша заявка! Вы не можете управлять ею.", show_alert=True)
+            return
 
         if action == "active":
             await db.execute("UPDATE numbers SET status = 'active' WHERE id = ?", (num_id,))
@@ -403,28 +391,24 @@ async def worker_logic(callback: CallbackQuery, bot: Bot):
         elif action == "error":
             await db.execute("UPDATE numbers SET status = 'dead', end_time = ? WHERE id = ?", (datetime.utcnow().isoformat(), num_id))
             await db.commit()
-            # Возвращаем панель к "Взять номер"
             await callback.message.edit_text("❌ Номер помечен как ошибка.\nГотов к следующему?", reply_markup=worker_take_kb())
             try: await bot.send_message(user_id, f"❌ Номер `{phone}` не подошел.", parse_mode="Markdown")
             except: pass
 
         elif action == "dead":
-            # СЛЕТ
             end_time = datetime.utcnow()
             await db.execute("UPDATE numbers SET status = 'finished', end_time = ? WHERE id = ?", (end_time.isoformat(), num_id))
             await db.commit()
             
-            # Расчет времени
             start_dt = datetime.fromisoformat(start_str)
             diff = end_time - start_dt
             hours, remainder = divmod(diff.seconds, 3600)
             minutes, _ = divmod(remainder, 60)
             duration_str = f"{hours}ч {minutes}мин"
             
-            # Возвращаем панель к "Взять номер"
             await callback.message.edit_text(
                 f"🏁 **ЗАВЕРШЕНО**\n📱 `{phone}`\n⏱ {duration_str}\n\n👇 Жми кнопку ниже:",
-                reply_markup=worker_take_kb(), # Кнопка возвращается!
+                reply_markup=worker_take_kb(),
                 parse_mode="Markdown"
             )
             try: await bot.send_message(user_id, f"📉 Номер `{phone}` слетел (завершен).\nВремя: {duration_str}", parse_mode="Markdown")
@@ -432,7 +416,7 @@ async def worker_logic(callback: CallbackQuery, bot: Bot):
     
     await callback.answer()
 
-# --- ПЕРЕСЫЛКА ФОТО/СМС (Исправленная) ---
+# --- ПЕРЕСЫЛКА ФОТО/СМС ---
 
 @router.message(F.photo & F.caption.startswith("/sms"))
 async def worker_sms_photo(message: types.Message, bot: Bot):
@@ -453,10 +437,15 @@ async def worker_sms_text(message: types.Message, command: CommandObject, bot: B
 
 async def send_to_user(message, bot, phone, text, is_photo):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM numbers WHERE phone = ? AND status IN ('work', 'active')", (phone,)) as c:
+        async with db.execute("SELECT user_id, worker_id FROM numbers WHERE phone = ? AND status IN ('work', 'active')", (phone,)) as c:
             row = await c.fetchone()
     
     if row:
+        # Можно добавить проверку, что отправляет тот же воркер
+        if row[1] is not None and row[1] != message.from_user.id:
+             await message.reply("🚫 Это не ваш номер. Вы не можете слать смс.")
+             return
+
         try:
             caption = f"🔔 **ВХОД!**\n📱 `{phone}`\n💬 **{text}**\n\n👇 Вводи код/сканируй QR!"
             if is_photo:
@@ -469,7 +458,6 @@ async def send_to_user(message, bot, phone, text, is_photo):
     else:
         await message.reply("❌ Номер не в работе.")
 
-# --- ПЕРЕСЫЛКА ОТВЕТА ОТ ЮЗЕРА ---
 @router.message(F.reply_to_message)
 async def user_reply(message: types.Message, bot: Bot):
     if message.chat.type != 'private': return
@@ -482,20 +470,18 @@ async def user_reply(message: types.Message, bot: Bot):
             
     if num and chat_id:
         try:
-            # Пересылаем в рабочий чат
             await bot.send_message(chat_id[0], f"📩 **ОТВЕТ ОТ ЮЗЕРА**\n📱 `{num[0]}`", parse_mode="Markdown")
             await message.forward(chat_id[0])
             await message.answer("✅ Передано.")
         except: pass
 
-# --- АДМИН ПАНЕЛЬ (НОВЫЕ ФУНКЦИИ) ---
+# --- АДМИН ПАНЕЛЬ ---
 
 @router.callback_query(F.data == "admin_panel_start")
 async def admin_start(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
     await callback.message.edit_text("🔧 **Админка FAST TEAM**", reply_markup=admin_kb(), parse_mode="Markdown")
 
-# 1. Скачать отчет
 @router.callback_query(F.data == "adm_report")
 async def admin_report(callback: CallbackQuery, bot: Bot):
     if callback.from_user.id != ADMIN_ID: return
@@ -503,7 +489,6 @@ async def admin_report(callback: CallbackQuery, bot: Bot):
     
     report_lines = []
     async with aiosqlite.connect(DB_NAME) as db:
-        # Берем только finished
         async with db.execute("""
             SELECT u.username, n.phone, n.start_time, n.end_time, n.tariff_price 
             FROM numbers n 
@@ -519,26 +504,26 @@ async def admin_report(callback: CallbackQuery, bot: Bot):
                     hours, rem = divmod(diff.seconds, 3600)
                     mins, _ = divmod(rem, 60)
                     dur = f"{hours}ч {mins}мин"
-                except: dur = "Ошибка времени"
+                except: dur = "Ошибка"
                 
                 line = f"@{uname or 'NoUser'} | {phone} | {dur} | {price}"
                 report_lines.append(line)
     
     file_data = "\n".join(report_lines).encode('utf-8')
+    # ИСПОЛЬЗУЕМ date.today() ТЕПЕРЬ БЕЗ ОШИБКИ
     input_file = BufferedInputFile(file_data, filename=f"report_{date.today()}.txt")
     await bot.send_document(callback.message.chat.id, input_file, caption="📄 Отчет готов")
 
-# 2. Изменить расписание
 @router.callback_query(F.data == "adm_schedule")
 async def adm_schedule_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("⏰ Введите время НАЧАЛА работы (МСК) в формате `ЧЧ:ММ` (например 07:00):", parse_mode="Markdown")
+    await callback.message.answer("⏰ Введите время НАЧАЛА (МСК) (напр. 07:00):")
     await state.set_state(AdminState.setting_schedule_start)
     await callback.answer()
 
 @router.message(AdminState.setting_schedule_start)
 async def adm_sched_start_set(message: types.Message, state: FSMContext):
     await state.update_data(start_t=message.text.strip())
-    await message.answer("⏰ Теперь введите время КОНЦА работы (например 17:30):")
+    await message.answer("⏰ Введите время КОНЦА (напр. 17:30):")
     await state.set_state(AdminState.setting_schedule_end)
 
 @router.message(AdminState.setting_schedule_end)
@@ -547,7 +532,6 @@ async def adm_sched_end_set(message: types.Message, state: FSMContext):
     start_t = data['start_t']
     end_t = message.text.strip()
     
-    # Сохраняем
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE config SET value = ? WHERE key = 'work_start'", (start_t,))
         await db.execute("UPDATE config SET value = ? WHERE key = 'work_end'", (end_t,))
@@ -556,20 +540,18 @@ async def adm_sched_end_set(message: types.Message, state: FSMContext):
     await message.answer(f"✅ График обновлен: {start_t} - {end_t} МСК")
     await state.clear()
 
-# 3. Редактор тарифов (Простой JSON редактор)
 @router.callback_query(F.data == "adm_tariffs")
 async def adm_tariffs_view(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key='tariffs'") as c:
-            t_json = (await c.fetchone())[0]
+            # ИСПРАВЛЕНО: ensure_ascii=False
+            t_data = json.loads((await c.fetchone())[0])
+            t_json_str = json.dumps(t_data, ensure_ascii=False, indent=2)
             
     await callback.message.answer(
-        f"💰 **Текущие тарифы (JSON):**\n`{t_json}`\n\n"
-        "Чтобы добавить/изменить тариф, введи название:",
+        f"💰 **Текущие тарифы:**\n\n```json\n{t_json_str}\n```\n",
         parse_mode="Markdown"
     )
-    # Здесь можно сделать сложнее, но пока простой проброс
-    # Для простоты - предлагаю просто добавить новый через стейт
 
 @router.callback_query(F.data == "admin_close")
 async def admin_close(callback: CallbackQuery):
@@ -577,7 +559,7 @@ async def admin_close(callback: CallbackQuery):
 
 # --- MAIN ---
 async def main():
-    print("🚀 FAST TEAM v10.0 Starting...")
+    print("🚀 FAST TEAM v10.1 (Fixed) Starting...")
     if not TOKEN or not ADMIN_ID: return
     await init_db()
     bot = Bot(token=TOKEN)
