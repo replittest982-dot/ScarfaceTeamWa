@@ -10,19 +10,20 @@ from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 
 # --- КОНФИГУРАЦИЯ ---
-TOKEN = os.getenv("BOT_TOKEN")
+# Вставь свои данные или используй переменные окружения
+TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v18.db" 
+DB_NAME = "fast_team_v19.db"
 
 MSK_OFFSET = 3 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
-# --- СОСТОЯНИЯ ---
+# --- СОСТОЯНИЯ (FSM) ---
 class UserState(StatesGroup):
     waiting_for_number = State()
 
@@ -34,9 +35,12 @@ class AdminState(StatesGroup):
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Таблица пользователей
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        
+        # Таблица номеров
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, method TEXT, 
             tariff_name TEXT, tariff_price TEXT, status TEXT, worker_id INTEGER, 
@@ -44,20 +48,20 @@ async def init_db():
             is_check_pending INTEGER DEFAULT 0, worker_msg_id INTEGER, 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        
+        # Конфигурация (Тарифы, Время работы, Привязки топиков)
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         
-        # Миграции
-        try: await db.execute("ALTER TABLE numbers ADD COLUMN last_ping TIMESTAMP"); 
-        except: pass
-        
+        # Дефолтные настройки
         default_tariffs = {"ВЦ RU": "4$ Час", "MAX ФБХ": "3.5$ / 0 минут"}
         await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('tariffs', ?)", (json.dumps(default_tariffs, ensure_ascii=False),))
         await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('work_start', '07:00')")
         await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('work_end', '17:30')")
         await db.commit()
 
-# --- ФУНКЦИИ ---
-def get_msk_time(): return datetime.utcnow() + timedelta(hours=MSK_OFFSET)
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_msk_time(): 
+    return datetime.utcnow() + timedelta(hours=MSK_OFFSET)
 
 async def check_work_hours(user_id):
     if user_id == ADMIN_ID: return True
@@ -78,36 +82,41 @@ def clean_phone(phone: str):
     if not re.match(r'^\+\d{10,15}$', clean): return None
     return clean
 
-# --- AFK SYSTEM ---
+# --- AFK МОНИТОР (ФОНОВАЯ ЗАДАЧА) ---
 async def queue_monitor(bot: Bot):
     while True:
         try:
             await asyncio.sleep(30)
             now = datetime.utcnow()
             async with aiosqlite.connect(DB_NAME) as db:
+                # 1. Спрашиваем "Ты тут?" через 5 минут
                 async with db.execute("SELECT id, user_id, phone, last_ping, created_at FROM numbers WHERE status = 'queue' AND is_check_pending = 0") as cursor:
                     rows = await cursor.fetchall()
                 for row in rows:
                     num_id, user_id, phone, last_ping, created_at = row
                     base = datetime.fromisoformat(last_ping if last_ping else created_at)
-                    if (now - base).total_seconds() > 300:
+                    if (now - base).total_seconds() > 300: # 5 минут
                         try:
                             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👋 Я ТУТ!", callback_data=f"afk_here_{num_id}")]])
-                            await bot.send_message(user_id, f"💤 **ВЫ ТУТ?**\nНомер `{phone}`.\nНажмите кнопку за 3 мин!", reply_markup=kb, parse_mode="Markdown")
+                            await bot.send_message(user_id, f"💤 **ВЫ ТУТ?**\nНомер `{phone}`.\nНажмите кнопку, иначе удалим через 3 мин!", reply_markup=kb, parse_mode="Markdown")
                             await db.execute("UPDATE numbers SET is_check_pending = 1, last_ping = ? WHERE id = ?", (now.isoformat(), num_id))
                             await db.commit()
                         except:
                             await db.execute("UPDATE numbers SET status = 'dead', end_time = ? WHERE id = ?", (now.isoformat(), num_id))
                             await db.commit()
+                
+                # 2. Удаляем, если не ответил за 3 минуты
                 async with db.execute("SELECT id, user_id, phone, last_ping FROM numbers WHERE status = 'queue' AND is_check_pending = 1") as cursor:
                     rows = await cursor.fetchall()
                 for row in rows:
                     if (now - datetime.fromisoformat(row[3])).total_seconds() > 180:
                         await db.execute("UPDATE numbers SET status = 'dead', end_time = ? WHERE id = ?", (now.isoformat(), row[0]))
                         await db.commit()
-                        try: await bot.send_message(row[1], f"❌ Номер `{row[2]}` удален за неактив.")
+                        try: await bot.send_message(row[1], f"❌ Номер `{row[2]}` удален из очереди (неактив).")
                         except: pass
-        except: await asyncio.sleep(5)
+        except Exception as e:
+            print(f"Monitor Error: {e}")
+            await asyncio.sleep(5)
 
 @router.callback_query(F.data.startswith("afk_here_"))
 async def afk_confirm(callback: CallbackQuery):
@@ -116,7 +125,7 @@ async def afk_confirm(callback: CallbackQuery):
         await db.execute("UPDATE numbers SET is_check_pending = 0, last_ping = ? WHERE id = ?", (datetime.utcnow().isoformat(), num_id))
         await db.commit()
     await callback.message.delete()
-    await callback.answer("✅ Вы в очереди!")
+    await callback.answer("✅ Вы остались в очереди!")
 
 # --- КЛАВИАТУРЫ ---
 async def main_menu_kb(user_id: int):
@@ -133,10 +142,8 @@ async def tariffs_kb():
     kb.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- КЛАВИАТУРЫ ВОРКЕРА ---
-
+# --- КЛАВИАТУРЫ ВОРКЕРА (ПРИВЯЗКА К ТОПИКУ) ---
 async def topic_setup_kb():
-    """Клавиатура для выбора тарифа (Админом)"""
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key='tariffs'") as c: 
             tariffs = json.loads((await c.fetchone())[0])
@@ -146,7 +153,6 @@ async def topic_setup_kb():
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 async def worker_auto_kb(chat_id, thread_id):
-    """Клавиатура 'Взять заявку' для конкретного топика"""
     key = f"topic_cfg_{chat_id}_{thread_id if thread_id else 0}"
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key=?", (key,)) as c:
@@ -173,11 +179,11 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика Очереди", callback_data="adm_queue_stats")],
         [InlineKeyboardButton(text="📥 Отчет за СЕГОДНЯ", callback_data="adm_report")],
-        [InlineKeyboardButton(text="⏰ Изменить Время", callback_data="adm_schedule"), InlineKeyboardButton(text="💰 Тарифы", callback_data="adm_tariffs")],
+        [InlineKeyboardButton(text="⏰ Время работы", callback_data="adm_schedule"), InlineKeyboardButton(text="💰 Тарифы", callback_data="adm_tariffs")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"), InlineKeyboardButton(text="⬅️ Выход", callback_data="admin_close")]
     ])
 
-# --- ЮЗЕР ЛОГИКА ---
+# --- ЛОГИКА ЮЗЕРА ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -251,35 +257,26 @@ async def receive_number(message: types.Message, state: FSMContext):
     await state.clear()
 
 # --- ВОРКЕР (ПРИВЯЗКА К ТОПИКУ) ---
-
 @router.message(Command("startwork"))
 async def worker_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     if message.chat.type not in ['group', 'supergroup']:
-        await message.answer("⚠️ Эту команду надо писать в рабочем чате/топике.")
+        await message.answer("⚠️ Пиши это в рабочем чате/топике!")
         return
-
-    await message.answer(
-        "🛠 **НАСТРОЙКА ТОПИКА**\n\nКакой тариф будет закреплен за этим чатом/топиком?",
-        reply_markup=await topic_setup_kb()
-    )
+    await message.answer("🛠 **НАСТРОЙКА ТОПИКА**\nКакой тариф привязать?", reply_markup=await topic_setup_kb())
 
 @router.callback_query(F.data.startswith("set_topic_"))
 async def set_topic_config(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID: 
-        await callback.answer("Только админ!", show_alert=True); return
-
-    tariff_name = callback.data.split("set_topic_")[1]
+    if callback.from_user.id != ADMIN_ID: return
+    t_name = callback.data.split("set_topic_")[1]
     chat_id = callback.message.chat.id
     thread_id = callback.message.message_thread_id if callback.message.is_topic_message else 0
     key = f"topic_cfg_{chat_id}_{thread_id}"
-    
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, tariff_name))
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, t_name))
         await db.commit()
-    
     kb = await worker_auto_kb(chat_id, thread_id)
-    await callback.message.edit_text(f"✅ **ГОТОВО!**\n\nЭтот топик привязан к тарифу: **{tariff_name}**.", reply_markup=kb)
+    await callback.message.edit_text(f"✅ Топик привязан к: **{t_name}**.", reply_markup=kb)
 
 @router.callback_query(F.data == "worker_refresh_auto")
 async def worker_refresh_auto(callback: CallbackQuery):
@@ -298,17 +295,15 @@ async def worker_take_auto(callback: CallbackQuery, bot: Bot):
     key = f"topic_cfg_{chat_id}_{thread_id}"
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM config WHERE key=?", (key,)) as c:
-            res = await c.fetchone()
-        if not res:
-            await callback.answer("⚠️ Топик не настроен!", show_alert=True); return
+        async with db.execute("SELECT value FROM config WHERE key=?", (key,)) as c: res = await c.fetchone()
+        if not res: await callback.answer("⚠️ Топик не настроен!", show_alert=True); return
+        t_name = res[0]
         
-        tariff_name = res[0]
-        async with db.execute("SELECT id, user_id, phone, method, tariff_price FROM numbers WHERE status = 'queue' AND tariff_name = ? ORDER BY id ASC LIMIT 1", (tariff_name,)) as c:
+        async with db.execute("SELECT id, user_id, phone, method, tariff_price FROM numbers WHERE status = 'queue' AND tariff_name = ? ORDER BY id ASC LIMIT 1", (t_name,)) as c:
             row = await c.fetchone()
             
         if not row:
-            await callback.answer(f"📭 Тариф {tariff_name} пуст!", show_alert=True)
+            await callback.answer(f"📭 Тариф {t_name} пуст!", show_alert=True)
             try: await callback.message.edit_reply_markup(reply_markup=await worker_auto_kb(chat_id, thread_id))
             except: pass
             return
@@ -318,7 +313,7 @@ async def worker_take_auto(callback: CallbackQuery, bot: Bot):
         await db.commit()
         
     m_str = "📷 QR" if method == 'qr' else "✉️ SMS"
-    text = f"🔧 **В РАБОТЕ**\n📱 `{phone}`\n💰 **{tariff_name}** ({price})\n📌 {m_str}\n\n`/sms {phone} текст`"
+    text = f"🔧 **В РАБОТЕ**\n📱 `{phone}`\n💰 **{t_name}** ({price})\n📌 {m_str}\n\n`/sms {phone} текст`"
     work_msg = await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=worker_active_kb(num_id))
     async with aiosqlite.connect(DB_NAME) as db: await db.execute("UPDATE numbers SET worker_msg_id = ? WHERE id = ?", (work_msg.message_id, num_id)); await db.commit()
     try: await bot.send_message(user_id, f"⚡️ Номер `{phone}` в работе!")
@@ -341,7 +336,6 @@ async def worker_fin(callback: CallbackQuery, bot: Bot):
     num_id = callback.data.split('_')[2]
     chat_id = callback.message.chat.id
     thread_id = callback.message.message_thread_id if callback.message.is_topic_message else 0
-    
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE numbers SET status = ?, end_time = ? WHERE id = ?", (act, datetime.utcnow().isoformat(), num_id))
         async with db.execute("SELECT phone, user_id FROM numbers WHERE id = ?", (num_id,)) as c: p, u = await c.fetchone()
@@ -386,41 +380,33 @@ async def usr_rep(msg: types.Message, bot: Bot):
 @router.callback_query(F.data == "admin_panel_start")
 async def adm_start(c: CallbackQuery, state: FSMContext):
     if c.from_user.id != ADMIN_ID: return
-    await state.clear() # Сбрасываем стейт при входе
+    await state.clear()
     await c.message.edit_text("🔧 **Админка FAST TEAM**", reply_markup=admin_kb(), parse_mode="Markdown")
 
-# 1. СТАТИСТИКА
 @router.callback_query(F.data == "adm_queue_stats")
-async def adm_stats(c: CallbackQuery, state: FSMContext):
-    await state.clear()
+async def adm_stats(c: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT tariff_name, COUNT(*) FROM numbers WHERE status = 'queue' GROUP BY tariff_name") as cursor:
             stats = await cursor.fetchall()
     text = "📊 **Очередь:**\n\n" + ("\n".join([f"🔹 {t}: {cnt} шт." for t, cnt in stats]) if stats else "Пусто")
-    # Используем edit_text
     await c.message.edit_text(text, reply_markup=admin_kb(), parse_mode="Markdown")
 
-# 2. ОТЧЕТ
 @router.callback_query(F.data == "adm_report")
-async def adm_rep(c: CallbackQuery, bot: Bot, state: FSMContext):
-    await state.clear()
+async def adm_rep(c: CallbackQuery, bot: Bot):
     await c.answer("Генерирую...")
     ts = datetime.combine(date.today(), datetime.min.time()).isoformat()
     lines = []
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT u.username, n.phone, n.tariff_price, n.tariff_name FROM numbers n JOIN users u ON n.user_id=u.user_id WHERE n.status='finished' AND n.end_time >= ?", (ts,)) as cur:
             async for r in cur: lines.append(f"@{r[0]}|{r[1]}|{r[2]}|{r[3]}")
-    if not lines: 
-        await c.message.answer("📂 Отчетов за сегодня нет.")
-    else:
-        f = BufferedInputFile("\n".join(lines).encode(), filename="rep.txt")
-        await bot.send_document(c.message.chat.id, f, caption="Отчет за сегодня")
+    if not lines: await c.message.answer("📂 Отчетов за сегодня нет."); return
+    f = BufferedInputFile("\n".join(lines).encode(), filename="rep.txt")
+    await bot.send_document(c.message.chat.id, f, caption="Отчет за сегодня")
 
-# 3. РАССЫЛКА
 @router.callback_query(F.data == "admin_broadcast")
 async def adm_br(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.answer("✍️ **Введите текст рассылки:**", reply_markup=None)
+    await c.message.answer("📢 Отправьте сообщение для рассылки:")
     await state.set_state(AdminState.waiting_for_broadcast)
     await c.answer()
 
@@ -432,11 +418,10 @@ async def adm_br_send(msg: types.Message, state: FSMContext):
             async for r in c:
                 try: await msg.copy_to(r[0]); cnt+=1; await asyncio.sleep(0.05)
                 except: pass
-    await msg.answer(f"✅ Разослано пользователям: {cnt}")
+    await msg.answer(f"✅ Разослано: {cnt}")
     await state.clear()
     await msg.answer("Админка", reply_markup=admin_kb())
 
-# 4. ВРЕМЯ
 @router.callback_query(F.data == "adm_schedule")
 async def adm_sched(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -460,10 +445,8 @@ async def adm_e_set(msg: types.Message, state: FSMContext):
     await msg.answer(f"✅ Обновлено: {d['s']} - {msg.text}")
     await state.clear()
 
-# 5. ТАРИФЫ
 @router.callback_query(F.data == "adm_tariffs")
-async def adm_trf(c: CallbackQuery, state: FSMContext):
-    await state.clear()
+async def adm_trf(c: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key='tariffs'") as c_db: t = json.loads((await c_db.fetchone())[0])
     await c.message.edit_text(f"💰 **Тарифы:**\n`{json.dumps(t, ensure_ascii=False, indent=2)}`", reply_markup=admin_kb(), parse_mode="Markdown")
@@ -480,7 +463,7 @@ async def main():
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    print("🚀 FAST TEAM v18.0 (IRONCLAD ADMIN) STARTED")
+    print("🚀 FAST TEAM v19.0 (FINAL) STARTED")
     asyncio.create_task(queue_monitor(bot))
     await dp.start_polling(bot)
 
