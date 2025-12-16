@@ -10,13 +10,13 @@ from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile, BufferedInputFile
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v17.db" 
+DB_NAME = "fast_team_v18.db" 
 
 MSK_OFFSET = 3 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -37,7 +37,6 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
-        
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, method TEXT, 
             tariff_name TEXT, tariff_price TEXT, status TEXT, worker_id INTEGER, 
@@ -45,7 +44,6 @@ async def init_db():
             is_check_pending INTEGER DEFAULT 0, worker_msg_id INTEGER, 
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
-        
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         
         # Миграции
@@ -149,14 +147,12 @@ async def topic_setup_kb():
 
 async def worker_auto_kb(chat_id, thread_id):
     """Клавиатура 'Взять заявку' для конкретного топика"""
-    # Узнаем какой тариф привязан
     key = f"topic_cfg_{chat_id}_{thread_id if thread_id else 0}"
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key=?", (key,)) as c:
             res = await c.fetchone()
             tariff_name = res[0] if res else "НЕ НАСТРОЕНО"
             
-        # Считаем очередь этого тарифа
         count = 0
         if tariff_name != "НЕ НАСТРОЕНО":
             async with db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND tariff_name=?", (tariff_name,)) as c:
@@ -177,7 +173,7 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика Очереди", callback_data="adm_queue_stats")],
         [InlineKeyboardButton(text="📥 Отчет за СЕГОДНЯ", callback_data="adm_report")],
-        [InlineKeyboardButton(text="⏰ Время работы", callback_data="adm_schedule"), InlineKeyboardButton(text="💰 Тарифы", callback_data="adm_tariffs")],
+        [InlineKeyboardButton(text="⏰ Изменить Время", callback_data="adm_schedule"), InlineKeyboardButton(text="💰 Тарифы", callback_data="adm_tariffs")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"), InlineKeyboardButton(text="⬅️ Выход", callback_data="admin_close")]
     ])
 
@@ -254,24 +250,20 @@ async def receive_number(message: types.Message, state: FSMContext):
     await message.answer(f"✅ **Принято!**\n📱 `{valid_phones[0]}`\n💰 {t_name}", reply_markup=await main_menu_kb(message.from_user.id), parse_mode="Markdown")
     await state.clear()
 
-# --- ВОРКЕР (НОВАЯ ЛОГИКА - ПРИВЯЗКА К ТОПИКУ) ---
+# --- ВОРКЕР (ПРИВЯЗКА К ТОПИКУ) ---
 
 @router.message(Command("startwork"))
 async def worker_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    # Работаем только в группах/супергруппах
     if message.chat.type not in ['group', 'supergroup']:
         await message.answer("⚠️ Эту команду надо писать в рабочем чате/топике.")
         return
 
-    # Админ запускает настройку
     await message.answer(
-        "🛠 **НАСТРОЙКА ТОПИКА**\n\nКакой тариф будет закреплен за этим чатом/топиком?\n"
-        "Воркеры будут получать номера ТОЛЬКО этого тарифа.",
+        "🛠 **НАСТРОЙКА ТОПИКА**\n\nКакой тариф будет закреплен за этим чатом/топиком?",
         reply_markup=await topic_setup_kb()
     )
 
-# 1. СОХРАНЕНИЕ НАСТРОЙКИ ТОПИКА
 @router.callback_query(F.data.startswith("set_topic_"))
 async def set_topic_config(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID: 
@@ -279,21 +271,16 @@ async def set_topic_config(callback: CallbackQuery):
 
     tariff_name = callback.data.split("set_topic_")[1]
     chat_id = callback.message.chat.id
-    # Получаем thread_id (если это топик, иначе 0)
     thread_id = callback.message.message_thread_id if callback.message.is_topic_message else 0
-    
-    # Ключ в БД: topic_cfg_CHATID_THREADID
     key = f"topic_cfg_{chat_id}_{thread_id}"
     
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, tariff_name))
         await db.commit()
     
-    # Показываем готовую панель работы
     kb = await worker_auto_kb(chat_id, thread_id)
-    await callback.message.edit_text(f"✅ **ГОТОВО!**\n\nЭтот топик привязан к тарифу: **{tariff_name}**.\nНажмите кнопку ниже, чтобы начать работу.", reply_markup=kb)
+    await callback.message.edit_text(f"✅ **ГОТОВО!**\n\nЭтот топик привязан к тарифу: **{tariff_name}**.", reply_markup=kb)
 
-# 2. ОБНОВЛЕНИЕ ПАНЕЛИ
 @router.callback_query(F.data == "worker_refresh_auto")
 async def worker_refresh_auto(callback: CallbackQuery):
     chat_id = callback.message.chat.id
@@ -303,7 +290,6 @@ async def worker_refresh_auto(callback: CallbackQuery):
     except: pass
     await callback.answer("Обновлено")
 
-# 3. ВЗЯТИЕ ЗАЯВКИ (АВТОМАТИЧЕСКИ ПО ПРИВЯЗКЕ)
 @router.callback_query(F.data == "worker_take_auto")
 async def worker_take_auto(callback: CallbackQuery, bot: Bot):
     chat_id = callback.message.chat.id
@@ -312,17 +298,12 @@ async def worker_take_auto(callback: CallbackQuery, bot: Bot):
     key = f"topic_cfg_{chat_id}_{thread_id}"
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Узнаем тариф
         async with db.execute("SELECT value FROM config WHERE key=?", (key,)) as c:
             res = await c.fetchone()
-            
         if not res:
-            await callback.answer("⚠️ Топик не настроен! Админ должен прописать /startwork", show_alert=True)
-            return
+            await callback.answer("⚠️ Топик не настроен!", show_alert=True); return
         
         tariff_name = res[0]
-        
-        # Ищем номер этого тарифа
         async with db.execute("SELECT id, user_id, phone, method, tariff_price FROM numbers WHERE status = 'queue' AND tariff_name = ? ORDER BY id ASC LIMIT 1", (tariff_name,)) as c:
             row = await c.fetchone()
             
@@ -343,7 +324,6 @@ async def worker_take_auto(callback: CallbackQuery, bot: Bot):
     try: await bot.send_message(user_id, f"⚡️ Номер `{phone}` в работе!")
     except: pass
 
-# --- СТАНДАРТНЫЕ ДЕЙСТВИЯ ВОРКЕРА ---
 @router.callback_query(F.data.startswith("w_act_"))
 async def worker_act(callback: CallbackQuery, bot: Bot):
     num_id = callback.data.split('_')[2]
@@ -367,10 +347,8 @@ async def worker_fin(callback: CallbackQuery, bot: Bot):
         async with db.execute("SELECT phone, user_id FROM numbers WHERE id = ?", (num_id,)) as c: p, u = await c.fetchone()
         await db.commit()
     
-    # ВОЗВРАЩАЕМ КНОПКУ ПРИВЯЗАННУЮ К ТОПИКУ
     kb = await worker_auto_kb(chat_id, thread_id)
     await callback.message.edit_text(f"🏁 Заявка закрыта.", reply_markup=kb)
-    
     msg = "📉 Слет/Выплата." if act == "finished" else "❌ Ошибка/Отмена."
     try: await bot.send_message(u, f"{msg}\n📱 `{p}`")
     except: pass
@@ -401,47 +379,108 @@ async def usr_rep(msg: types.Message, bot: Bot):
     if msg.chat.type != 'private': return
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT phone FROM numbers WHERE user_id = ? AND status IN ('work', 'active') LIMIT 1", (msg.from_user.id,)) as c: n = await c.fetchone()
-        # Тут поиск чата сложнее, так как топики разные. Просто шлем в сохраненный последний.
-        # Для упрощения - шлем туда где была настройка, но лучше искать воркера.
-        # В этой версии шлем просто в чат группы (общий) или если найдем привязку.
-        # Упрощение: шлем в чат, если нашли номер.
-    # (Опускаем сложную логику поиска топика для ответа, чтобы не усложнять код, обычно воркеры сами видят по номеру)
     if n: await msg.answer("✅ Передано воркеру.")
 
-# --- АДМИНКА ---
-@router.callback_query(F.data == "admin_panel_start")
-async def adm_start(c: CallbackQuery):
-    if c.from_user.id == ADMIN_ID: await c.message.edit_text("🔧 **Админка**", reply_markup=admin_kb(), parse_mode="Markdown")
+# --- АДМИНКА (ИСПРАВЛЕННАЯ) ---
 
+@router.callback_query(F.data == "admin_panel_start")
+async def adm_start(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID: return
+    await state.clear() # Сбрасываем стейт при входе
+    await c.message.edit_text("🔧 **Админка FAST TEAM**", reply_markup=admin_kb(), parse_mode="Markdown")
+
+# 1. СТАТИСТИКА
 @router.callback_query(F.data == "adm_queue_stats")
-async def adm_q_stats(c: CallbackQuery):
+async def adm_stats(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT tariff_name, COUNT(*) FROM numbers WHERE status = 'queue' GROUP BY tariff_name") as cursor:
             stats = await cursor.fetchall()
-    text = "📊 **Статистика Очереди:**\n\n" + ("\n".join([f"🔹 **{t}**: {cnt} шт." for t, cnt in stats]) if stats else "Пусто")
-    await c.message.answer(text, parse_mode="Markdown"); await c.answer()
+    text = "📊 **Очередь:**\n\n" + ("\n".join([f"🔹 {t}: {cnt} шт." for t, cnt in stats]) if stats else "Пусто")
+    # Используем edit_text
+    await c.message.edit_text(text, reply_markup=admin_kb(), parse_mode="Markdown")
 
+# 2. ОТЧЕТ
 @router.callback_query(F.data == "adm_report")
-async def adm_rep(c: CallbackQuery, bot: Bot):
+async def adm_rep(c: CallbackQuery, bot: Bot, state: FSMContext):
+    await state.clear()
+    await c.answer("Генерирую...")
     ts = datetime.combine(date.today(), datetime.min.time()).isoformat()
     lines = []
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT u.username, n.phone, n.tariff_price, n.tariff_name FROM numbers n JOIN users u ON n.user_id=u.user_id WHERE n.status='finished' AND n.end_time >= ?", (ts,)) as cur:
             async for r in cur: lines.append(f"@{r[0]}|{r[1]}|{r[2]}|{r[3]}")
-    if not lines: await c.answer("Пусто", show_alert=True); return
-    f = BufferedInputFile("\n".join(lines).encode(), filename="rep.txt")
-    await bot.send_document(c.message.chat.id, f, caption="Отчет за сегодня")
+    if not lines: 
+        await c.message.answer("📂 Отчетов за сегодня нет.")
+    else:
+        f = BufferedInputFile("\n".join(lines).encode(), filename="rep.txt")
+        await bot.send_document(c.message.chat.id, f, caption="Отчет за сегодня")
 
-@router.callback_query(F.data == "adm_close")
-async def adm_cls(c: CallbackQuery): await c.message.delete()
+# 3. РАССЫЛКА
+@router.callback_query(F.data == "admin_broadcast")
+async def adm_br(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.answer("✍️ **Введите текст рассылки:**", reply_markup=None)
+    await state.set_state(AdminState.waiting_for_broadcast)
+    await c.answer()
+
+@router.message(AdminState.waiting_for_broadcast)
+async def adm_br_send(msg: types.Message, state: FSMContext):
+    cnt = 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as c:
+            async for r in c:
+                try: await msg.copy_to(r[0]); cnt+=1; await asyncio.sleep(0.05)
+                except: pass
+    await msg.answer(f"✅ Разослано пользователям: {cnt}")
+    await state.clear()
+    await msg.answer("Админка", reply_markup=admin_kb())
+
+# 4. ВРЕМЯ
+@router.callback_query(F.data == "adm_schedule")
+async def adm_sched(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.answer("⏰ Введите НАЧАЛО (напр. 07:00):")
+    await state.set_state(AdminState.setting_schedule_start)
+    await c.answer()
+
+@router.message(AdminState.setting_schedule_start)
+async def adm_s_set(msg: types.Message, state: FSMContext):
+    await state.update_data(s=msg.text)
+    await msg.answer("⏰ Введите КОНЕЦ (напр. 17:30):")
+    await state.set_state(AdminState.setting_schedule_end)
+
+@router.message(AdminState.setting_schedule_end)
+async def adm_e_set(msg: types.Message, state: FSMContext):
+    d = await state.get_data()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE config SET value=? WHERE key='work_start'",(d['s'],))
+        await db.execute("UPDATE config SET value=? WHERE key='work_end'",(msg.text,))
+        await db.commit()
+    await msg.answer(f"✅ Обновлено: {d['s']} - {msg.text}")
+    await state.clear()
+
+# 5. ТАРИФЫ
+@router.callback_query(F.data == "adm_tariffs")
+async def adm_trf(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT value FROM config WHERE key='tariffs'") as c_db: t = json.loads((await c_db.fetchone())[0])
+    await c.message.edit_text(f"💰 **Тарифы:**\n`{json.dumps(t, ensure_ascii=False, indent=2)}`", reply_markup=admin_kb(), parse_mode="Markdown")
+
+@router.callback_query(F.data == "admin_close")
+async def adm_cls(c: CallbackQuery, state: FSMContext): 
+    await state.clear()
+    await c.message.delete()
 
 # --- START ---
 async def main():
+    if not TOKEN or not ADMIN_ID: print("❌ ЗАПОЛНИ TOKEN/ADMIN_ID"); return
     await init_db()
     bot = Bot(token=TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    print("🚀 FAST TEAM v17.0 (Topic Binder) READY")
+    print("🚀 FAST TEAM v18.0 (IRONCLAD ADMIN) STARTED")
     asyncio.create_task(queue_monitor(bot))
     await dp.start_polling(bot)
 
