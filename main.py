@@ -151,10 +151,8 @@ def method_select_kb():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]
     ])
 
-# Клавиатура управления номером для воркера (ИСПРАВЛЕНА)
 def worker_finish_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
-        # Заменили текст "💰 ВЫПЛАТА" на "✅ Встал"
         [InlineKeyboardButton(text="✅ Встал", callback_data=f"w_fin_{num_id}"), 
          InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")],
         [InlineKeyboardButton(text="❌ ОШИБКА", callback_data=f"w_err_{num_id}")]
@@ -257,8 +255,7 @@ async def nav_main(c: CallbackQuery, state: FSMContext):
     await state.clear()
     try:
         await c.message.edit_text("👋 Главное меню", reply_markup=main_menu_kb(c.from_user.id))
-    except TelegramBadRequest:
-        pass # Игнорируем, если текст не изменился
+    except TelegramBadRequest: pass
 
 @router.callback_query(F.data == "menu_profile")
 async def show_profile(c: CallbackQuery):
@@ -491,17 +488,17 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
     try: await bot.send_message(u, f"{m}\n📱 `{p}`")
     except: pass
 
-# --- SMS HANDLER (ИСПРАВЛЕННЫЙ) ---
+# --- SMS HANDLER (FIXED FOR ARGUMENTS) ---
 @router.message(Command("sms"))
-async def sms_h(m: types.Message, cmd: CommandObject, bot: Bot):
-    if not cmd.args: return
+async def sms_h(m: types.Message, command: CommandObject, bot: Bot):
+    if not command.args: 
+        await m.reply("⚠️ Формат: `/sms номер текст`")
+        return
     try:
-        # Разбиваем текст
-        args = cmd.args.split(' ', 1)
+        args = command.args.split(' ', 1)
         ph_raw = args[0]
         tx = args[1] if len(args) > 1 else "Код"
         
-        # ЧИСТИМ НОМЕР ПЕРЕД ПОИСКОМ
         ph = clean_phone(ph_raw)
         
         if not ph:
@@ -516,7 +513,6 @@ async def sms_h(m: types.Message, cmd: CommandObject, bot: Bot):
             await bot.send_message(r[0], f"🔔 SMS / Код\n📱 `{ph}`\n💬 `{tx}`", parse_mode="Markdown")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
-            # Либо номера нет в работе, либо пишет не тот воркер
             await m.reply(f"🚫 Номер {ph} не найден в работе или вы не его воркер.")
     except Exception as e: 
         logging.error(f"SMS Error: {e}")
@@ -703,7 +699,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     
-    print("🚀 v24.1 FINAL FIX STARTED")
+    print("🚀 v24.2 STABLE STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
