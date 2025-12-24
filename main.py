@@ -470,27 +470,37 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
         await c.answer("🚫 Это чужой номер!", show_alert=True)
         return
 
+    # ЛОГИКА СТАТУСОВ И СООБЩЕНИЙ
     if "w_fin_" in c.data: 
-        s, m = "finished", "💰 Успешно (Встал)!"
+        status_db = "finished"
+        msg_header = "✅ ВЫПЛАТА (ВСТАЛ)"
+        msg_user = "💰 Оплата начислена!"
     elif "w_drop_" in c.data: 
-        s, m = "drop", "📉 Номер слетел."
+        status_db = "drop"
+        msg_header = "📉 СЛЕТ (БАН/ОТМЕНА)"
+        msg_user = "📉 Номер слетел / забанен."
     else: 
-        s, m = "dead", "❌ Ошибка."
+        status_db = "dead"
+        msg_header = "❌ ОШИБКА"
+        msg_user = "❌ Произошла ошибка."
     
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE numbers SET status = ?, end_time = ? WHERE id = ?", (s, datetime.utcnow().isoformat(), num_id))
+        await db.execute("UPDATE numbers SET status = ?, end_time = ? WHERE id = ?", (status_db, datetime.utcnow().isoformat(), num_id))
         async with db.execute("SELECT phone, user_id FROM numbers WHERE id = ?", (num_id,)) as cur: 
             res = await cur.fetchone()
             p, u = res if res else (None, None)
         await db.commit()
 
-    await c.message.edit_text(f"🏁 Финал [{s}]: `{p}`\n👤 Воркер: {c.from_user.first_name}")
-    try: await bot.send_message(u, f"{m}\n📱 `{p}`")
+    # Финальное сообщение в чат воркеров
+    await c.message.edit_text(f"{msg_header}\n📱 `{p}`\n👤 Воркер: {c.from_user.first_name}", parse_mode="Markdown")
+    
+    # Уведомление юзеру
+    try: await bot.send_message(u, f"{msg_user}\n📱 `{p}`")
     except: pass
 
-# --- SMS HANDLER (FIXED FOR ARGUMENTS) ---
+# --- SMS HANDLER (ТЕКСТ) ---
 @router.message(Command("sms"))
-async def sms_h(m: types.Message, command: CommandObject, bot: Bot):
+async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     if not command.args: 
         await m.reply("⚠️ Формат: `/sms номер текст`")
         return
@@ -498,7 +508,6 @@ async def sms_h(m: types.Message, command: CommandObject, bot: Bot):
         args = command.args.split(' ', 1)
         ph_raw = args[0]
         tx = args[1] if len(args) > 1 else "Код"
-        
         ph = clean_phone(ph_raw)
         
         if not ph:
@@ -513,9 +522,38 @@ async def sms_h(m: types.Message, command: CommandObject, bot: Bot):
             await bot.send_message(r[0], f"🔔 SMS / Код\n📱 `{ph}`\n💬 `{tx}`", parse_mode="Markdown")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
-            await m.reply(f"🚫 Номер {ph} не найден в работе или вы не его воркер.")
+            await m.reply(f"🚫 Номер {ph} не найден или вы не его воркер.")
     except Exception as e: 
-        logging.error(f"SMS Error: {e}")
+        pass
+
+# --- SMS HANDLER (ФОТО) ---
+@router.message(F.photo & F.caption.startswith("/sms"))
+async def sms_photo_handler(m: types.Message, bot: Bot):
+    try:
+        # Разбиваем caption: "/sms +7999 текст"
+        args = m.caption.split(' ', 2)
+        if len(args) < 2:
+            await m.reply("⚠️ Формат: `/sms номер текст` (с фото)")
+            return
+            
+        ph_raw = args[1]
+        tx = args[2] if len(args) > 2 else "Фото"
+        ph = clean_phone(ph_raw)
+        
+        if not ph:
+            await m.reply("❌ Неверный номер.")
+            return
+            
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id, worker_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
+                r = await cur.fetchone()
+                
+        if r and (r[1] == m.from_user.id or m.from_user.id == ADMIN_ID):
+            await bot.send_photo(r[0], m.photo[-1].file_id, caption=f"🔔 SMS / Код\n📱 `{ph}`\n💬 `{tx}`", parse_mode="Markdown")
+            await m.react([types.ReactionTypeEmoji(emoji="👍")])
+        else: 
+            await m.reply(f"🚫 Номер {ph} не найден или вы не его воркер.")
+    except Exception as e:
         pass
 
 # --- АДМИН ПАНЕЛЬ ---
@@ -699,7 +737,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     
-    print("🚀 v24.2 STABLE STARTED")
+    print("🚀 v24.3 PHOTO & MESSAGE FIX STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
