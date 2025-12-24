@@ -11,12 +11,13 @@ from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.exceptions import TelegramBadRequest
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v24.db" # Новая база для чистого старта v24
+DB_NAME = "fast_team_v24.db"
 MSK_OFFSET = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -28,7 +29,6 @@ class UserState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_for_broadcast = State()
-    # Управление тарифами
     trf_adding_name = State()
     trf_adding_price = State()
     trf_adding_hold = State()
@@ -39,7 +39,6 @@ class AdminState(StatesGroup):
 # --- БАЗА ДАННЫХ (INIT) ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица пользователей
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, 
             username TEXT, 
@@ -48,7 +47,6 @@ async def init_db():
             reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
-        # Таблица номеров
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
@@ -67,7 +65,6 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
-        # Таблица тарифов
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
@@ -77,9 +74,7 @@ async def init_db():
             work_end TEXT DEFAULT '23:59'
         )""")
 
-        # Конфигурация
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
-        
         await db.commit()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -91,28 +86,22 @@ def extract_price(price_str):
     return float(match.group(1)) if match else 0.0
 
 async def check_tariff_hours(tariff_name):
-    if not tariff_name: 
-        return False
-        
+    if not tariff_name: return False
     now_msk = get_msk_time().time()
     
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT work_start, work_end FROM tariffs WHERE name=?", (tariff_name,)) as c:
             res = await c.fetchone()
             
-    if not res: 
-        return True
+    if not res: return True
     
     s_str, e_str = res
     try:
         st = datetime.strptime(s_str, "%H:%M").time()
         et = datetime.strptime(e_str, "%H:%M").time()
-        if st <= et: 
-            return st <= now_msk <= et
-        else: 
-            return st <= now_msk or now_msk <= et
-    except: 
-        return True
+        if st <= et: return st <= now_msk <= et
+        else: return st <= now_msk or now_msk <= et
+    except: return True
 
 def clean_phone(phone: str):
     clean = re.sub(r'[^\d+]', '', phone)
@@ -141,9 +130,7 @@ async def tariffs_kb_user():
     kb = []
     for i in range(0, len(rows), 2):
         row = []
-        # Первая кнопка в ряду
         row.append(InlineKeyboardButton(text=f"{rows[i][0]} | {rows[i][1]}", callback_data=f"trf_pick_{rows[i][0]}"))
-        # Вторая кнопка (если есть)
         if i+1 < len(rows): 
             row.append(InlineKeyboardButton(text=f"{rows[i+1][0]} | {rows[i+1][1]}", callback_data=f"trf_pick_{rows[i+1][0]}"))
         kb.append(row)
@@ -164,15 +151,15 @@ def method_select_kb():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]
     ])
 
-# Клавиатура управления номером для воркера
+# Клавиатура управления номером для воркера (ИСПРАВЛЕНА)
 def worker_finish_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 ВЫПЛАТА", callback_data=f"w_fin_{num_id}"), 
+        # Заменили текст "💰 ВЫПЛАТА" на "✅ Встал"
+        [InlineKeyboardButton(text="✅ Встал", callback_data=f"w_fin_{num_id}"), 
          InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")],
         [InlineKeyboardButton(text="❌ ОШИБКА", callback_data=f"w_err_{num_id}")]
     ])
 
-# Клавиатура Админа
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Тарифы", callback_data="adm_tariffs_menu")],
@@ -268,7 +255,10 @@ async def access_control(c: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "nav_main")
 async def nav_main(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text("👋 Главное меню", reply_markup=main_menu_kb(c.from_user.id))
+    try:
+        await c.message.edit_text("👋 Главное меню", reply_markup=main_menu_kb(c.from_user.id))
+    except TelegramBadRequest:
+        pass # Игнорируем, если текст не изменился
 
 @router.callback_query(F.data == "menu_profile")
 async def show_profile(c: CallbackQuery):
@@ -291,8 +281,10 @@ async def show_profile(c: CallbackQuery):
             f"📅 Дата регистрации: {reg_date}\n"
             f"🔥 Сдано за сегодня: {today_count} шт.\n"
             f"📦 Всего сдано: {total_count} шт.")
-            
-    await c.message.edit_text(text, reply_markup=back_kb(), parse_mode="Markdown")
+    
+    try:        
+        await c.message.edit_text(text, reply_markup=back_kb(), parse_mode="Markdown")
+    except TelegramBadRequest: pass
 
 @router.callback_query(F.data == "select_tariff")
 async def step_tariff(c: CallbackQuery):
@@ -372,7 +364,7 @@ async def receive_number(message: types.Message, state: FSMContext):
 async def show_guide(c: CallbackQuery):
     await c.message.edit_text("ℹ️ Помощь\nСдавай номера кнопкой Сдать номер.", reply_markup=back_kb())
 
-# --- ВОРКЕРСКАЯ ЧАСТЬ (ТОПИКИ И КОМАНДЫ) ---
+# --- ВОРКЕРСКАЯ ЧАСТЬ ---
 @router.message(Command("startwork"))
 async def worker_setup(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
@@ -434,7 +426,6 @@ async def cmd_num(message: types.Message, bot: Bot):
         
         if not t_res: return
 
-        # Берем номер из очереди
         async with db.execute("SELECT id, user_id, phone, method, tariff_price, tariff_hold FROM numbers WHERE status = 'queue' AND tariff_name = ? ORDER BY id ASC LIMIT 1", (t_res[0],)) as cur:
             row = await cur.fetchone()
         
@@ -444,7 +435,6 @@ async def cmd_num(message: types.Message, bot: Bot):
         
         num_id, user_id, phone, method, price, hold = row
         
-        # --- ФИКС АТОМАРНОЙ БЛОКИРОВКИ ---
         cursor = await db.execute("UPDATE numbers SET status = 'work', worker_id = ?, start_time = ? WHERE id = ? AND status = 'queue'", 
                                  (message.from_user.id, datetime.utcnow().isoformat(), num_id))
         
@@ -479,13 +469,12 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
             res = await cur.fetchone()
             owner_id = res[0] if res else None
 
-    # Проверка "Свой-Чужой"
     if owner_id != c.from_user.id and c.from_user.id != ADMIN_ID:
         await c.answer("🚫 Это чужой номер!", show_alert=True)
         return
 
     if "w_fin_" in c.data: 
-        s, m = "finished", "💰 Выплата начислена!"
+        s, m = "finished", "💰 Успешно (Встал)!"
     elif "w_drop_" in c.data: 
         s, m = "drop", "📉 Номер слетел."
     else: 
@@ -502,12 +491,23 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
     try: await bot.send_message(u, f"{m}\n📱 `{p}`")
     except: pass
 
-# --- SMS HANDLER ---
+# --- SMS HANDLER (ИСПРАВЛЕННЫЙ) ---
 @router.message(Command("sms"))
 async def sms_h(m: types.Message, cmd: CommandObject, bot: Bot):
     if not cmd.args: return
     try:
-        ph, tx = cmd.args.split(' ', 1)
+        # Разбиваем текст
+        args = cmd.args.split(' ', 1)
+        ph_raw = args[0]
+        tx = args[1] if len(args) > 1 else "Код"
+        
+        # ЧИСТИМ НОМЕР ПЕРЕД ПОИСКОМ
+        ph = clean_phone(ph_raw)
+        
+        if not ph:
+            await m.reply("❌ Неверный формат номера. Нужно +7...")
+            return
+
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT user_id, worker_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
                 r = await cur.fetchone()
@@ -516,8 +516,11 @@ async def sms_h(m: types.Message, cmd: CommandObject, bot: Bot):
             await bot.send_message(r[0], f"🔔 SMS / Код\n📱 `{ph}`\n💬 `{tx}`", parse_mode="Markdown")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
-            await m.reply("🚫 Ошибка доступа или номер не в работе.")
-    except: pass
+            # Либо номера нет в работе, либо пишет не тот воркер
+            await m.reply(f"🚫 Номер {ph} не найден в работе или вы не его воркер.")
+    except Exception as e: 
+        logging.error(f"SMS Error: {e}")
+        pass
 
 # --- АДМИН ПАНЕЛЬ ---
 @router.callback_query(F.data == "admin_panel_start")
@@ -538,7 +541,9 @@ async def adm_queue_s(c: CallbackQuery):
     for t, count in stats: 
         text += f"🔹 {t}: {count} шт.\n"
     
-    await c.message.edit_text(text, reply_markup=admin_kb())
+    try:
+        await c.message.edit_text(text, reply_markup=admin_kb())
+    except TelegramBadRequest: pass
 
 @router.callback_query(F.data == "admin_broadcast")
 async def adm_br_start(c: CallbackQuery, state: FSMContext):
@@ -574,12 +579,13 @@ async def adm_report(c: CallbackQuery):
     text = f"📅 ОТЧЕТ ({date.today()})\n\n"
     
     async with aiosqlite.connect(DB_NAME) as db:
-        # Берем только успешные (finished)
         async with db.execute("SELECT phone, tariff_price FROM numbers WHERE status='finished' AND end_time >= ?", (ts,)) as cur: 
             rows = await cur.fetchall()
             
     if not rows: 
-        await c.message.edit_text("📂 Сегодня пусто.", reply_markup=admin_kb())
+        try:
+            await c.message.edit_text("📂 Сегодня пусто.", reply_markup=admin_kb())
+        except TelegramBadRequest: pass
         return
         
     for r in rows:
@@ -589,11 +595,13 @@ async def adm_report(c: CallbackQuery):
         
     text += f"\n💵 ИТОГО: {total}$"
     
-    if len(text) > 4000:
-        f = BufferedInputFile(text.encode(), filename="report.txt")
-        await c.message.answer_document(f, caption=f"💵 {total}$")
-    else: 
-        await c.message.edit_text(text, reply_markup=admin_kb(), parse_mode="Markdown")
+    try:
+        if len(text) > 4000:
+            f = BufferedInputFile(text.encode(), filename="report.txt")
+            await c.message.answer_document(f, caption=f"💵 {total}$")
+        else: 
+            await c.message.edit_text(text, reply_markup=admin_kb(), parse_mode="Markdown")
+    except TelegramBadRequest: pass
 
 # --- УПРАВЛЕНИЕ ТАРИФАМИ ---
 @router.callback_query(F.data == "adm_tariffs_menu")
@@ -682,7 +690,6 @@ async def adm_trf_sv(m: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "admin_close")
 async def adm_cls(c: CallbackQuery): 
-    # Вместо удаления перекидываем в главное меню, так интерфейс "не сносится"
     await nav_main(c, None)
 
 # --- ЗАПУСК ---
@@ -696,7 +703,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     
-    print("🚀 v24.0 CLEAN STARTED")
+    print("🚀 v24.1 FINAL FIX STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
