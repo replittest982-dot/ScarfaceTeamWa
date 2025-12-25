@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime, time, timedelta, date
 
-# Библиотеки Aiogram и БД
+# --- БИБЛИОТЕКИ ---
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command, CommandStart, CommandObject
@@ -15,7 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 
-# Попытка импорта Redis (если установлен)
+# --- REDIS (ЕСЛИ ЕСТЬ) ---
 try:
     from aiogram.fsm.storage.redis import RedisStorage
     from redis.asyncio import Redis
@@ -23,7 +23,7 @@ try:
 except ImportError:
     HAS_REDIS = False
 
-# Загрузка .env (на всякий случай)
+# --- .ENV ---
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -41,7 +41,7 @@ MSK_OFFSET = 3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
-# --- СОСТОЯНИЯ (FSM) ---
+# --- FSM СОСТОЯНИЯ ---
 class UserState(StatesGroup):
     waiting_for_number = State()
 
@@ -54,9 +54,10 @@ class AdminState(StatesGroup):
     trf_adding_end = State()
     trf_editing_value = State()
 
-# --- БАЗА ДАННЫХ (INIT) ---
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Юзеры
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, 
             username TEXT, 
@@ -65,6 +66,7 @@ async def init_db():
             reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
+        # Номера
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
@@ -83,6 +85,7 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
+        # Тарифы
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
@@ -92,8 +95,10 @@ async def init_db():
             work_end TEXT DEFAULT '23:59'
         )""")
 
+        # Конфиги чатов
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         await db.commit()
+        print("✅ БАЗА ДАННЫХ ПОДКЛЮЧЕНА (FULL MODE)")
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_msk_time(): 
@@ -169,7 +174,7 @@ def method_select_kb():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]
     ])
 
-# --- КЛАВИАТУРЫ ВОРКЕРА ---
+# ВОРКЕРСКИЕ КНОПКИ
 def worker_initial_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{num_id}"), 
@@ -181,6 +186,7 @@ def worker_active_kb(num_id):
         [InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")]
     ])
 
+# АДМИНСКИЕ КНОПКИ
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Тарифы", callback_data="adm_tariffs_menu")],
@@ -220,7 +226,7 @@ def access_request_kb(user_id):
          InlineKeyboardButton(text="🚫 Отказать", callback_data=f"acc_no_{user_id}")]
     ])
 
-# --- ЛОГИКА БОТА ---
+# --- ЛОГИКА /START И ДОСТУПА ---
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -272,7 +278,8 @@ async def access_control(c: CallbackQuery, bot: Bot):
     else:
         await c.message.edit_text(f"🚫 Отказано ID `{user_id}`")
 
-# --- ЮЗЕРСКАЯ ЧАСТЬ ---
+# --- ЮЗЕРСКАЯ ЧАСТЬ (МЕНЮ, ПРОФИЛЬ, СДАЧА) ---
+
 @router.callback_query(F.data == "nav_main")
 async def nav_main(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -384,7 +391,8 @@ async def receive_number(message: types.Message, state: FSMContext):
 async def show_guide(c: CallbackQuery):
     await c.message.edit_text("ℹ️ Помощь\nСдавай номера кнопкой Сдать номер.", reply_markup=back_kb())
 
-# --- ВОРКЕРСКАЯ ЧАСТЬ ---
+# --- ВОРКЕРСКАЯ ЧАСТЬ (ТОПИКИ И НОМЕРА) ---
+
 @router.message(Command("startwork"))
 async def worker_setup(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
@@ -433,7 +441,7 @@ async def set_topic(c: CallbackQuery):
                   f"3. Нажимайте кнопки только на своем номере!")
     await c.message.edit_text(guide_text)
 
-# --- КОМАНДА /NUM (ЭТАП 1) ---
+# --- КОМАНДА /NUM ---
 @router.message(Command("num"))
 async def cmd_num(message: types.Message, bot: Bot):
     chat_id = message.chat.id
@@ -480,7 +488,6 @@ async def cmd_num(message: types.Message, bot: Bot):
     try: await bot.send_message(user_id, f"⚡️ Воркер принял номер {phone}. Ждите код.")
     except: pass
 
-# --- ОБРАБОТЧИК КНОПКИ "ВСТАЛ" (ЭТАП 2 - ПЕРЕХОД К "СЛЕТ") ---
 @router.callback_query(F.data.startswith("w_act_"))
 async def worker_activate(c: CallbackQuery, bot: Bot):
     num_id = c.data.split('_')[2]
@@ -494,10 +501,9 @@ async def worker_activate(c: CallbackQuery, bot: Bot):
         await c.answer("🚫 Это чужой номер!", show_alert=True)
         return
         
-    # Меняем сообщение на "СЛЕТ", кнопка одна: СЛЕТ
+    # Смена на СЛЕТ
     await c.message.edit_text(f"СЛЕТ\n📱 {phone}", reply_markup=worker_active_kb(num_id))
 
-# --- ОБРАБОТЧИК ФИНАЛА (СЛЕТ или ОШИБКА) ---
 @router.callback_query(F.data.startswith("w_drop_") | F.data.startswith("w_err_"))
 async def worker_fin_secure(c: CallbackQuery, bot: Bot):
     num_id = c.data.split('_')[2]
@@ -523,26 +529,25 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
             p, u = res if res else (None, None)
         await db.commit()
 
-    # Финальное сообщение
     await c.message.edit_text(f"Финал {s}: {p}\n👤 Воркер: {c.from_user.first_name}")
     try: await bot.send_message(u, f"{m}\n📱 {p}")
     except: pass
 
-# --- SMS HANDLER (ФОТО) - ЖБ ВЕРСИЯ ---
-# Стоит первым, чтобы ловить любые фото с подписями
+# --- ФОТО ХЕНДЛЕР (v26.5 FIXED: ЛЮБЫЕ ПРОБЕЛЫ) ---
 @router.message(F.photo)
 async def sms_photo_handler(m: types.Message, bot: Bot):
-    # Если нет подписи, сразу выходим
     if not m.caption: return
 
-    # Проверка команды в подписи (ищем /sms в начале)
-    if not m.caption.strip().startswith("/sms"): return
+    # Проверка команды
+    caption = m.caption.strip()
+    if not caption.startswith("/sms"): return
 
     try:
-        # Разбиваем подпись
-        parts = m.caption.split(' ', 2)
+        # split(None, 2) = делим по пробелам/энтерам, максимум 3 части
+        parts = caption.split(None, 2)
+        
         if len(parts) < 2:
-            await m.reply("⚠️ Формат подписи к фото: /sms номер текст")
+            await m.reply("⚠️ Формат: /sms номер текст")
             return
             
         ph_raw = parts[1]
@@ -550,7 +555,7 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
         ph = clean_phone(ph_raw)
         
         if not ph:
-            await m.reply("❌ Некорректный номер в подписи.")
+            await m.reply(f"❌ Некорректный номер: {ph_raw}")
             return
 
         async with aiosqlite.connect(DB_NAME) as db:
@@ -558,19 +563,22 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
                 r = await cur.fetchone()
                 
         if r:
-            # ОТПРАВЛЯЕМ ИМЕННО ФОТО (send_photo)
-            await bot.send_photo(
-                chat_id=r[0], 
-                photo=m.photo[-1].file_id, 
-                caption=f"🔔 SMS / Код (ФОТО)\n📱 {ph}\n💬 {tx}"
-            )
-            await m.react([types.ReactionTypeEmoji(emoji="👍")])
+            # ОТПРАВЛЯЕМ ФОТО
+            try:
+                await bot.send_photo(
+                    chat_id=r[0], 
+                    photo=m.photo[-1].file_id, 
+                    caption=f"🔔 SMS / Код (ФОТО)\n📱 {ph}\n💬 {tx}"
+                )
+                await m.react([types.ReactionTypeEmoji(emoji="👍")])
+            except Exception as e:
+                await m.reply(f"❌ Не удалось отправить фото (Бот заблокирован?): {e}")
         else: 
-            await m.reply(f"🚫 Номер {ph} не найден в работе. Проверь цифры!")
+            await m.reply(f"🚫 Номер {ph} не найден в статусе 'В работе'.")
     except Exception as e:
         logging.error(f"Ошибка фото: {e}")
 
-# --- SMS HANDLER (ТЕКСТ) ---
+# --- ТЕКСТОВЫЙ SMS ХЕНДЛЕР ---
 @router.message(Command("sms"))
 async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     if not command.args: 
@@ -594,6 +602,7 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     except: pass
 
 # --- АДМИН ПАНЕЛЬ ---
+
 @router.callback_query(F.data == "admin_panel_start")
 async def adm_start(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
@@ -650,6 +659,7 @@ async def adm_report(c: CallbackQuery):
     text = f"📅 ОТЧЕТ ({date.today()})\n\n"
     
     async with aiosqlite.connect(DB_NAME) as db:
+        # В отчет идут только finished.
         async with db.execute("SELECT phone, tariff_price FROM numbers WHERE status='finished' AND end_time >= ?", (ts,)) as cur: 
             rows = await cur.fetchall()
             
@@ -674,7 +684,8 @@ async def adm_report(c: CallbackQuery):
             await c.message.edit_text(text, reply_markup=admin_kb(), parse_mode="Markdown")
     except TelegramBadRequest: pass
 
-# --- УПРАВЛЕНИЕ ТАРИФАМИ ---
+# --- АДМИН: УПРАВЛЕНИЕ ТАРИФАМИ ---
+
 @router.callback_query(F.data == "adm_tariffs_menu")
 async def adm_trf_menu(c: CallbackQuery):
     await c.message.edit_text("💰 Управление тарифами", reply_markup=await admin_tariffs_list_kb())
@@ -771,24 +782,23 @@ async def main():
         
     await init_db()
     
-    # Настройка Хранилища (Redis или Memory)
+    # Настройка Хранилища
     if HAS_REDIS and os.getenv("REDIS_URL"):
-        redis_url = os.getenv("REDIS_URL")
         try:
-            storage = RedisStorage.from_url(redis_url)
-            print("🟢 Подключен REDIS для хранения состояний!")
+            storage = RedisStorage.from_url(os.getenv("REDIS_URL"))
+            print("🟢 Подключен REDIS!")
         except Exception as e:
             storage = MemoryStorage()
             print(f"🟡 Ошибка Redis ({e}). Используется RAM.")
     else:
         storage = MemoryStorage()
-        print("🟡 Redis не найден. Используется RAM (MemoryStorage).")
+        print("🟡 Redis не найден. Используется RAM.")
 
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
     
-    print("🚀 v26.3 JB PHOTO STARTED")
+    print("🚀 v26.6 FULL VERSION STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
