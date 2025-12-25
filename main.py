@@ -14,9 +14,11 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 from aiogram.exceptions import TelegramBadRequest
 
 # --- КОНФИГУРАЦИЯ ---
-TOKEN = os.getenv("BOT_TOKEN")
+# Вставь свой токен сюда или в переменные окружения
+TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
+
 DB_NAME = "fast_team_v25.db" 
 MSK_OFFSET = 3
 
@@ -39,6 +41,7 @@ class AdminState(StatesGroup):
 # --- БАЗА ДАННЫХ (INIT) ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Таблица пользователей
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, 
             username TEXT, 
@@ -47,6 +50,7 @@ async def init_db():
             reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
+        # Таблица номеров
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
@@ -65,6 +69,7 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
+        # Таблица тарифов
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
@@ -74,6 +79,7 @@ async def init_db():
             work_end TEXT DEFAULT '23:59'
         )""")
 
+        # Конфигурация (привязка топиков)
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         await db.commit()
 
@@ -151,16 +157,16 @@ def method_select_kb():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]
     ])
 
-# --- НОВЫЕ КЛАВИАТУРЫ ВОРКЕРА (СТРОГО ПО ТЗ) ---
+# --- КЛАВИАТУРЫ ВОРКЕРА ---
 
-# 1. Сразу после выдачи: ТОЛЬКО "ВСТАЛ" и "ОШИБКА"
+# 1. Сразу после выдачи (ЭТАП 1)
 def worker_initial_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{num_id}"), 
          InlineKeyboardButton(text="Ошибка ❌", callback_data=f"w_err_{num_id}")]
     ])
 
-# 2. После нажатия "Встал": ТОЛЬКО КНОПКА "СЛЕТ" (выплаты нет)
+# 2. После нажатия "Встал" (ЭТАП 2 - ТОЛЬКО СЛЕТ)
 def worker_active_kb(num_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")]
@@ -418,7 +424,7 @@ async def set_topic(c: CallbackQuery):
                   f"3. Нажимайте кнопки только на своем номере!")
     await c.message.edit_text(guide_text)
 
-# --- КОМАНДА /NUM (ПЕРВЫЙ ЭТАП) ---
+# --- КОМАНДА /NUM (ЭТАП 1) ---
 @router.message(Command("num"))
 async def cmd_num(message: types.Message, bot: Bot):
     chat_id = message.chat.id
@@ -465,7 +471,7 @@ async def cmd_num(message: types.Message, bot: Bot):
     try: await bot.send_message(user_id, f"⚡️ Воркер принял номер {phone}. Ждите код.")
     except: pass
 
-# --- ОБРАБОТЧИК КНОПКИ "ВСТАЛ" (ПЕРЕХОД НА ВТОРОЙ ЭТАП) ---
+# --- ОБРАБОТЧИК КНОПКИ "ВСТАЛ" (ПЕРЕХОД НА ЭТАП 2) ---
 @router.callback_query(F.data.startswith("w_act_"))
 async def worker_activate(c: CallbackQuery, bot: Bot):
     num_id = c.data.split('_')[2]
@@ -479,9 +485,7 @@ async def worker_activate(c: CallbackQuery, bot: Bot):
         await c.answer("🚫 Это чужой номер!", show_alert=True)
         return
         
-    # Просто меняем сообщение на "СЛЕТ" и даем кнопку "СЛЕТ", без выплаты.
-    # Статус в базе можно оставить 'work' или сменить на 'active', для логики это не критично, но пусть будет work.
-    
+    # Просто меняем сообщение на "СЛЕТ" и даем кнопку "СЛЕТ"
     await c.message.edit_text(f"СЛЕТ\n📱 {phone}", reply_markup=worker_active_kb(num_id))
 
 # --- ОБРАБОТЧИК ФИНАЛА (СЛЕТ или ОШИБКА) ---
@@ -510,13 +514,13 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
             p, u = res if res else (None, None)
         await db.commit()
 
-    # Финальное сообщение без кавычек
+    # Финальное сообщение
     await c.message.edit_text(f"Финал {s}: {p}\n👤 Воркер: {c.from_user.first_name}")
     try: await bot.send_message(u, f"{m}\n📱 {p}")
     except: pass
 
-# --- SMS HANDLER (ТЕКСТ) ---
-@router.message(Command("sms"))
+# --- SMS HANDLER (ТОЛЬКО ТЕКСТ) ---
+@router.message(Command("sms"), F.text)
 async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     if not command.args: 
         await m.reply("⚠️ Формат: /sms номер текст")
@@ -524,53 +528,45 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     try:
         args = command.args.split(' ', 1)
         ph_raw = args[0]
-        tx = args[1] if len(args) > 1 else "Код"
+        tx = args[1] if len(args) > 1 else "Код в сообщении выше"
         ph = clean_phone(ph_raw)
         
-        if not ph:
-            await m.reply("❌ Неверный формат номера. Нужно +7...")
-            return
-
         async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT user_id, worker_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
+            async with db.execute("SELECT user_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
                 r = await cur.fetchone()
                 
-        if r and (r[1] == m.from_user.id or m.from_user.id == ADMIN_ID):
+        if r:
             await bot.send_message(r[0], f"🔔 SMS / Код\n📱 {ph}\n💬 {tx}")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
-            await m.reply(f"🚫 Номер {ph} не найден или вы не его воркер.")
-    except Exception as e: 
-        pass
+            await m.reply(f"🚫 Номер {ph} не найден в работе.")
+    except: pass
 
-# --- SMS HANDLER (ФОТО) ---
-@router.message(F.photo & F.caption.startswith("/sms"))
+# --- SMS HANDLER (ПЕРЕСЫЛКА ФОТО) ---
+@router.message(F.photo, F.caption.startswith("/sms"))
 async def sms_photo_handler(m: types.Message, bot: Bot):
     try:
         args = m.caption.split(' ', 2)
-        if len(args) < 2:
-            await m.reply("⚠️ Формат: /sms номер текст (с фото)")
-            return
+        if len(args) < 2: return
             
         ph_raw = args[1]
-        tx = args[2] if len(args) > 2 else "Фото"
+        tx = args[2] if len(args) > 2 else "Код на фото выше 👆"
         ph = clean_phone(ph_raw)
         
-        if not ph:
-            await m.reply("❌ Неверный номер.")
-            return
-            
         async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT user_id, worker_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
+            async with db.execute("SELECT user_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
                 r = await cur.fetchone()
                 
-        if r and (r[1] == m.from_user.id or m.from_user.id == ADMIN_ID):
-            await bot.send_photo(r[0], m.photo[-1].file_id, caption=f"🔔 SMS / Код\n📱 {ph}\n💬 {tx}")
+        if r:
+            await bot.send_photo(
+                chat_id=r[0], 
+                photo=m.photo[-1].file_id, 
+                caption=f"🔔 SMS / Код (ФОТО)\n📱 {ph}\n💬 {tx}"
+            )
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
-            await m.reply(f"🚫 Номер {ph} не найден или вы не его воркер.")
-    except Exception as e:
-        pass
+            await m.reply(f"🚫 Номер {ph} не найден.")
+    except: pass
 
 # --- АДМИН ПАНЕЛЬ ---
 @router.callback_query(F.data == "admin_panel_start")
@@ -753,7 +749,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     
-    print("🚀 v25.1 STRICT LOGIC STARTED")
+    print("🚀 v25.2 FULL FIX STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
