@@ -72,7 +72,7 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
         
         await db.commit()
-        logging.info("🚀 FAST TEAM BOT v27.1 STARTED & DB CONNECTED")
+        logging.info("🚀 FAST TEAM BOT v27.2 HOTFIX STARTED & DB CONNECTED")
 
 # --- UTILS ---
 def clean_phone(phone: str):
@@ -362,12 +362,14 @@ async def step_tariff(c: CallbackQuery):
     kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")])
     await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+# --- !!! ФИКС ОШИБКИ ЗДЕСЬ !!! ---
 @router.callback_query(F.data.startswith("trf_pick_"))
 async def step_method(c: CallbackQuery, state: FSMContext):
     t_name = c.data.split('trf_pick_')[1]
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT price, hold_info FROM tariffs WHERE name=?", (t_name,)) as c: 
-            res = await c.fetchone()
+        # ЗАМЕНИЛ 'as c' НА 'as cur', ЧТОБЫ НЕ БЫЛО ОШИБКИ
+        async with db.execute("SELECT price, hold_info FROM tariffs WHERE name=?", (t_name,)) as cur: 
+            res = await cur.fetchone()
             
     if not res: return await c.answer("Тариф удален")
     
