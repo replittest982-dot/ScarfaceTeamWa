@@ -13,6 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.exceptions import TelegramBadRequest
 
 # --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN") 
@@ -20,7 +21,7 @@ ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
 DB_NAME = "fast_team_v27.db" 
 
-# Настройка логгирования
+# Логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
@@ -30,22 +31,22 @@ class UserState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_for_broadcast = State()
-    # Тарифы
     trf_adding_name = State()
     trf_adding_price = State()
     trf_adding_hold = State()
 
-# --- DATABASE ---
+# --- DATABASE INIT ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Таблица юзеров
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, 
             username TEXT, 
             first_name TEXT, 
             is_approved INTEGER DEFAULT 0, 
-            reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+            reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         
+        # Таблица номеров
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
@@ -58,29 +59,27 @@ async def init_db():
             worker_id INTEGER, 
             last_ping TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            end_time TIMESTAMP
-        )""")
+            end_time TIMESTAMP)""")
             
+        # Таблица тарифов
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             name TEXT UNIQUE, 
             price TEXT, 
-            hold_info TEXT
-        )""")
+            hold_info TEXT)""")
             
+        # Конфиг (привязки топиков)
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        
         await db.commit()
-        logging.info("✅ DATABASE CONNECTED v27.0")
+        logging.info("🚀 FAST TEAM BOT v27.1 STARTED & DB CONNECTED")
 
 # --- UTILS ---
 def clean_phone(phone: str):
-    # Оставляем цифры и плюс
     clean = re.sub(r'[^\d+]', '', str(phone))
-    # Форматирование под +7
     if clean.startswith('8') and len(clean) == 11: clean = '+7' + clean[1:]
     elif clean.startswith('7') and len(clean) == 11: clean = '+' + clean
     elif len(clean) == 10 and clean.isdigit(): clean = '+7' + clean
-    # Проверка на валидность
     return clean if re.match(r'^\+\d{10,15}$', clean) else None
 
 # --- KEYBOARDS ---
@@ -105,10 +104,10 @@ def worker_active_kb(num_id):
         InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")
     ]])
 
-# --- WORKER: PHOTO HANDLER (FIXED) ---
+# --- WORKER: PHOTO & SMS HANDLERS ---
 @router.message(F.photo)
 async def sms_photo_handler(m: types.Message, bot: Bot):
-    # Логика: Воркер кидает фото с подписью "/sms +7999... текст"
+    # Воркер кидает фото с подписью: /sms +79990000000 текст
     if not m.caption: return
     caption_clean = m.caption.strip()
     if not caption_clean.startswith("/sms"): return
@@ -132,12 +131,11 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
             await bot.send_photo(chat_id=r[0], photo=m.photo[-1].file_id, caption=f"🔔 **SMS / КОД**\n📱 `{ph}`\n💬 {tx}", parse_mode="Markdown")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else:
-            await m.reply(f"🚫 Номер {ph} не найден в активной работе.")
+            await m.reply(f"🚫 Номер {ph} не найден в работе.")
     except Exception as e:
         logging.error(f"Error photo: {e}")
         await m.reply("❌ Ошибка отправки фото.")
 
-# --- WORKER: TEXT SMS ---
 @router.message(Command("sms"))
 async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     if not command.args: return await m.reply("⚠️ Формат: /sms номер код")
@@ -156,14 +154,14 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
             await m.reply(f"🚫 Номер {ph} не в работе.")
     except: pass
 
-# --- WORKER FLOW (TOPICS) ---
+# --- WORKER FLOW & SETUP ---
 @router.message(Command("startwork"))
 async def worker_setup(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT name FROM tariffs") as c: rows = await c.fetchall()
     
-    if not rows: return await message.answer("❌ Нет тарифов.")
+    if not rows: return await message.answer("❌ Нет тарифов. Создайте их в админке.")
     
     kb = [[InlineKeyboardButton(text=f"📌 {r[0]}", callback_data=f"set_topic_{r[0]}")] for r in rows]
     await message.answer("⚙️ **Настройка привязки**\nВыберите тариф для этого чата:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
@@ -180,7 +178,18 @@ async def set_topic(c: CallbackQuery):
     
     # Удаляем меню выбора
     await c.message.delete()
-    await c.message.answer(f"✅ Топик привязан к: **{t_name}**", parse_mode="Markdown")
+    
+    # Отправляем ТУТОРИАЛ (ИНСТРУКЦИЮ)
+    tutorial_text = (
+        f"✅ **Топик успешно привязан!**\n"
+        f"💎 Тариф: **{t_name}**\n\n"
+        f"📋 **ИНСТРУКЦИЯ ДЛЯ ВОРКЕРОВ:**\n"
+        f"1️⃣ Взять номер: `/num`\n"
+        f"2️⃣ Отправить код: `/sms номер код`\n"
+        f"3️⃣ Если просят скрин/QR: кидайте фото с подписью `/sms номер текст`\n"
+        f"⚠️ Нажимайте кнопки только на своих заявках!"
+    )
+    await c.message.answer(tutorial_text, parse_mode="Markdown")
 
 @router.message(Command("stopwork"))
 async def stop_work(message: types.Message):
@@ -197,12 +206,12 @@ async def cmd_num(message: types.Message, bot: Bot):
     tid = message.message_thread_id if message.is_topic_message else 0
     
     async with aiosqlite.connect(DB_NAME) as db:
-        # 1. Какой тариф здесь?
+        # 1. Проверяем привязку
         async with db.execute("SELECT value FROM config WHERE key=?", (f"topic_cfg_{cid}_{tid}",)) as cur:
             t_res = await cur.fetchone()
-        if not t_res: return # Топик не привязан
+        if not t_res: return 
         
-        # 2. Берем номер из очереди
+        # 2. Берем номер из очереди (самый старый)
         async with db.execute("SELECT id, user_id, phone, tariff_price FROM numbers WHERE status = 'queue' AND tariff_name = ? ORDER BY created_at ASC LIMIT 1", (t_res[0],)) as cur:
             row = await cur.fetchone()
         
@@ -227,13 +236,15 @@ async def worker_activate(c: CallbackQuery):
         async with db.execute("SELECT phone FROM numbers WHERE id = ?", (nid,)) as cur:
             res = await cur.fetchone()
         await db.commit()
-    # Меняем сообщение на СЛЕТ
+    
+    # Заменяем сообщение на "СЛЕТ"
     await c.message.edit_text(f"📉 **СЛЕТ**\n📱 `{res[0]}`", reply_markup=worker_active_kb(nid), parse_mode="Markdown")
 
 @router.callback_query(F.data.startswith("w_drop_") | F.data.startswith("w_err_"))
 async def worker_fin(c: CallbackQuery, bot: Bot):
     nid = c.data.split('_')[2]
-    st = "drop" if "drop" in c.data else "dead" # drop = успех/слет, dead = ошибка
+    # drop = успешно слетел, dead = ошибка
+    st = "drop" if "drop" in c.data else "dead" 
     
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT phone, user_id FROM numbers WHERE id=?", (nid,)) as cur: 
@@ -251,7 +262,7 @@ async def worker_fin(c: CallbackQuery, bot: Bot):
         await bot.send_message(res[1], msg)
     except: pass
 
-# --- USER INTERFACE ---
+# --- USER COMMANDS & HANDLERS ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -279,7 +290,6 @@ async def cmd_start(message: types.Message):
 async def show_profile(c: CallbackQuery):
     uid = c.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
-        # Статистика юзера
         async with db.execute("SELECT COUNT(*), SUM(CAST(tariff_price AS REAL)) FROM numbers WHERE user_id=? AND status='drop'", (uid,)) as cur:
             stats = await cur.fetchone()
             count = stats[0] or 0
@@ -294,8 +304,8 @@ async def show_profile(c: CallbackQuery):
         f"🆔 ID: `{uid}`\n"
         f"📅 В команде с: {reg}\n\n"
         f"📊 **Твоя статистика:**\n"
-        f"✅ Сдано номеров: **{count}**\n"
-        f"💰 Заработано: **{money}$**"
+        f"✅ Сдано: **{count}**\n"
+        f"💰 Профит: **{money}$**"
     )
     await c.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_kb(uid))
 
@@ -330,7 +340,7 @@ async def public_queue_view(c: CallbackQuery):
     kb = [[InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]]
     await c.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-# --- TARIFF & NUMBER LOGIC ---
+# --- TARIFF & ADD NUMBER LOGIC ---
 @router.callback_query(F.data == "select_tariff")
 async def step_tariff(c: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -341,7 +351,6 @@ async def step_tariff(c: CallbackQuery):
     await c.message.edit_text("👇 **Выберите куда хотите сдать номер:**", parse_mode="Markdown")
     
     kb = []
-    # Группируем по 2 кнопки в ряд
     current_row = []
     for r in rows:
         current_row.append(InlineKeyboardButton(text=r[0], callback_data=f"trf_pick_{r[0]}"))
@@ -394,7 +403,7 @@ async def receive_number(message: types.Message, state: FSMContext):
     if not message.text: return
     d = await state.get_data()
     
-    # Пакетная обработка (разбивка по строкам и запятым)
+    # Пакетная обработка: разбиваем по переносу строки
     raw_lines = message.text.replace(',', '\n').split('\n')
     added = 0
     
@@ -417,7 +426,7 @@ async def nav_back(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.edit_text("👋 **Добро пожаловать в FAST TEAM**", parse_mode="Markdown", reply_markup=main_menu_kb(c.from_user.id))
 
-# --- ADMIN PANEL & REPORTS ---
+# --- ADMIN PANEL ---
 @router.callback_query(F.data == "admin_panel_start")
 async def adm_start(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
@@ -430,9 +439,7 @@ async def adm_start(c: CallbackQuery):
 
 @router.callback_query(F.data == "adm_report")
 async def adm_report_gen(c: CallbackQuery):
-    # Генерация TXT отчета
     async with aiosqlite.connect(DB_NAME) as db:
-        # Выбираем всех (можно добавить фильтр по дате, если нужно)
         async with db.execute("""
             SELECT u.username, n.phone, n.end_time, n.status, n.tariff_price 
             FROM numbers n 
@@ -443,12 +450,11 @@ async def adm_report_gen(c: CallbackQuery):
             
     if not rows: return await c.answer("База пуста")
     
-    # Формируем контент
     buffer = io.BytesIO()
     total_payout = 0.0
     
     lines = ["USER | PHONE | TIME | STATUS | PRICE"]
-    lines.append("-" * 50)
+    lines.append("-" * 55)
     
     for r in rows:
         uname = r[0] or "NoUser"
@@ -457,7 +463,6 @@ async def adm_report_gen(c: CallbackQuery):
         status = r[3]
         price = float(r[4]) if r[4] else 0.0
         
-        # Считаем выплату только если статус drop (успех)
         payout_mark = ""
         if status == "drop":
             total_payout += price
@@ -467,7 +472,7 @@ async def adm_report_gen(c: CallbackQuery):
             
         lines.append(f"{uname:<15} | {phone:<12} | {time} | {status} | {price}{payout_mark}")
     
-    lines.append("-" * 50)
+    lines.append("-" * 55)
     lines.append(f"TOTAL PAYOUT: {total_payout}$")
     lines.append(f"TOTAL NUMBERS: {len(rows)}")
     
@@ -477,10 +482,10 @@ async def adm_report_gen(c: CallbackQuery):
     file = BufferedInputFile(buffer.read(), filename=f"report_{datetime.now().strftime('%Y%m%d')}.txt")
     await c.message.answer_document(file, caption=f"📄 Отчет сформирован.\nК выплате: **{total_payout}$**", parse_mode="Markdown")
 
-# --- ADMIN: ADD TARIFF ---
+# --- ADMIN: ADD/DEL TARIFF ---
 @router.callback_query(F.data == "adm_trf_add")
 async def adm_trf_add_start(c: CallbackQuery, state: FSMContext):
-    await c.message.edit_text("📝 Название (пример: RU WA):")
+    await c.message.edit_text("📝 Название (например: RU WA):")
     await state.set_state(AdminState.trf_adding_name)
 
 @router.message(AdminState.trf_adding_name)
@@ -506,6 +511,23 @@ async def adm_trf_final(m: types.Message, state: FSMContext):
         except:
             await m.answer("❌ Ошибка (возможно имя занято).")
     await state.clear()
+
+@router.callback_query(F.data == "adm_trf_del_menu")
+async def adm_trf_del_menu(c: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, name FROM tariffs") as cur: rows = await cur.fetchall()
+    kb = [[InlineKeyboardButton(text=f"❌ {r[1]}", callback_data=f"del_trf_{r[0]}")] for r in rows]
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel_start")])
+    await c.message.edit_text("🗑 Выбери тариф для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data.startswith("del_trf_"))
+async def adm_trf_del(c: CallbackQuery):
+    tid = int(c.data.split("_")[2])
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM tariffs WHERE id=?", (tid,))
+        await db.commit()
+    await c.answer("Тариф удален!")
+    await adm_trf_del_menu(c)
 
 # --- ACCESS CONTROL ---
 @router.callback_query(F.data.startswith("acc_"))
