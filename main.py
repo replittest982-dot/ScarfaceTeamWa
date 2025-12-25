@@ -23,17 +23,21 @@ try:
 except ImportError:
     HAS_REDIS = False
 
+# Загрузка .env (на всякий случай)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # --- КОНФИГУРАЦИЯ ---
-# Вставь токен прямо сюда или в .env
 TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
 
-# Настройки БД и времени
 DB_NAME = "fast_team_v26.db" 
 MSK_OFFSET = 3
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
@@ -53,7 +57,6 @@ class AdminState(StatesGroup):
 # --- БАЗА ДАННЫХ (INIT) ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица пользователей
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, 
             username TEXT, 
@@ -62,7 +65,6 @@ async def init_db():
             reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
-        # Таблица номеров
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
@@ -81,7 +83,6 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         
-        # Таблица тарифов
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
@@ -91,10 +92,8 @@ async def init_db():
             work_end TEXT DEFAULT '23:59'
         )""")
 
-        # Конфигурация (привязка топиков)
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         await db.commit()
-        print("✅ База данных SQLite подключена и сохраняется в файл.")
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_msk_time(): 
@@ -123,7 +122,6 @@ async def check_tariff_hours(tariff_name):
     except: return True
 
 def clean_phone(phone: str):
-    # Очистка номера от мусора
     clean = re.sub(r'[^\d+]', '', phone)
     if clean.startswith('8') and len(clean) == 11: clean = '+7' + clean[1:]
     elif clean.startswith('7') and len(clean) == 11: clean = '+' + clean
@@ -172,15 +170,12 @@ def method_select_kb():
     ])
 
 # --- КЛАВИАТУРЫ ВОРКЕРА ---
-
-# ЭТАП 1: Выдали номер. Только "Встал" и "Ошибка"
 def worker_initial_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{num_id}"), 
          InlineKeyboardButton(text="Ошибка ❌", callback_data=f"w_err_{num_id}")]
     ])
 
-# ЭТАП 2: Нажал "Встал". Только "СЛЕТ".
 def worker_active_kb(num_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")]
@@ -533,28 +528,37 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
     try: await bot.send_message(u, f"{m}\n📱 {p}")
     except: pass
 
-# --- SMS HANDLER (ФОТО) - СТОИТ ПЕРВЫМ! ---
+# --- SMS HANDLER (ФОТО) - ЖБ ВЕРСИЯ ---
+# Стоит первым, чтобы ловить любые фото с подписями
 @router.message(F.photo)
 async def sms_photo_handler(m: types.Message, bot: Bot):
-    # Если нет подписи или она не начинается с /sms - игнорируем, пусть обрабатывают другие хендлеры (если есть)
-    if not m.caption or not m.caption.startswith("/sms"):
-        return
+    # Если нет подписи, сразу выходим
+    if not m.caption: return
+
+    # Проверка команды в подписи (ищем /sms в начале)
+    if not m.caption.strip().startswith("/sms"): return
 
     try:
-        args = m.caption.split(' ', 2)
-        if len(args) < 2:
-            await m.reply("⚠️ Формат подписи: /sms номер текст")
+        # Разбиваем подпись
+        parts = m.caption.split(' ', 2)
+        if len(parts) < 2:
+            await m.reply("⚠️ Формат подписи к фото: /sms номер текст")
             return
             
-        ph_raw = args[1]
-        tx = args[2] if len(args) > 2 else "Код на фото 👆"
+        ph_raw = parts[1]
+        tx = parts[2] if len(parts) > 2 else "Код на фото 👆"
         ph = clean_phone(ph_raw)
         
+        if not ph:
+            await m.reply("❌ Некорректный номер в подписи.")
+            return
+
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT user_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
                 r = await cur.fetchone()
                 
         if r:
+            # ОТПРАВЛЯЕМ ИМЕННО ФОТО (send_photo)
             await bot.send_photo(
                 chat_id=r[0], 
                 photo=m.photo[-1].file_id, 
@@ -562,8 +566,9 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
             )
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
-            await m.reply(f"🚫 Номер {ph} не найден в работе.")
-    except: pass
+            await m.reply(f"🚫 Номер {ph} не найден в работе. Проверь цифры!")
+    except Exception as e:
+        logging.error(f"Ошибка фото: {e}")
 
 # --- SMS HANDLER (ТЕКСТ) ---
 @router.message(Command("sms"))
@@ -645,7 +650,6 @@ async def adm_report(c: CallbackQuery):
     text = f"📅 ОТЧЕТ ({date.today()})\n\n"
     
     async with aiosqlite.connect(DB_NAME) as db:
-        # В отчет идут только finished. Если нужно добавить drop, измени статус в запросе
         async with db.execute("SELECT phone, tariff_price FROM numbers WHERE status='finished' AND end_time >= ?", (ts,)) as cur: 
             rows = await cur.fetchall()
             
@@ -769,21 +773,22 @@ async def main():
     
     # Настройка Хранилища (Redis или Memory)
     if HAS_REDIS and os.getenv("REDIS_URL"):
-        # Если есть библиотека redis И есть ссылка на редис в .env
         redis_url = os.getenv("REDIS_URL")
-        storage = RedisStorage.from_url(redis_url)
-        print("🟢 Подключен REDIS для хранения состояний!")
+        try:
+            storage = RedisStorage.from_url(redis_url)
+            print("🟢 Подключен REDIS для хранения состояний!")
+        except Exception as e:
+            storage = MemoryStorage()
+            print(f"🟡 Ошибка Redis ({e}). Используется RAM.")
     else:
-        # Иначе используем оперативную память (работает всегда)
         storage = MemoryStorage()
-        print("🟡 Redis не найден или не настроен. Используется RAM (MemoryStorage).")
-        print("   -> Основная база SQLite работает и сохраняется в файл.")
+        print("🟡 Redis не найден. Используется RAM (MemoryStorage).")
 
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
     
-    print("🚀 v26.0 FINAL STARTED")
+    print("🚀 v26.3 JB PHOTO STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
