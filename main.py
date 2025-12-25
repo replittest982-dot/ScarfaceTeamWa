@@ -3,25 +3,37 @@ import logging
 import sys
 import os
 import re
-import json
 from datetime import datetime, time, timedelta, date
+
+# Библиотеки Aiogram и БД
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 
+# Попытка импорта Redis (если установлен)
+try:
+    from aiogram.fsm.storage.redis import RedisStorage
+    from redis.asyncio import Redis
+    HAS_REDIS = True
+except ImportError:
+    HAS_REDIS = False
+
 # --- КОНФИГУРАЦИЯ ---
-# Вставь свой токен сюда или в переменные окружения
+# Вставь токен прямо сюда или в .env
 TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
 
-DB_NAME = "fast_team_v25.db" 
+# Настройки БД и времени
+DB_NAME = "fast_team_v26.db" 
 MSK_OFFSET = 3
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
@@ -82,6 +94,7 @@ async def init_db():
         # Конфигурация (привязка топиков)
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         await db.commit()
+        print("✅ База данных SQLite подключена и сохраняется в файл.")
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_msk_time(): 
@@ -110,6 +123,7 @@ async def check_tariff_hours(tariff_name):
     except: return True
 
 def clean_phone(phone: str):
+    # Очистка номера от мусора
     clean = re.sub(r'[^\d+]', '', phone)
     if clean.startswith('8') and len(clean) == 11: clean = '+7' + clean[1:]
     elif clean.startswith('7') and len(clean) == 11: clean = '+' + clean
@@ -159,14 +173,14 @@ def method_select_kb():
 
 # --- КЛАВИАТУРЫ ВОРКЕРА ---
 
-# 1. Сразу после выдачи (ЭТАП 1)
+# ЭТАП 1: Выдали номер. Только "Встал" и "Ошибка"
 def worker_initial_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{num_id}"), 
          InlineKeyboardButton(text="Ошибка ❌", callback_data=f"w_err_{num_id}")]
     ])
 
-# 2. После нажатия "Встал" (ЭТАП 2 - ТОЛЬКО СЛЕТ)
+# ЭТАП 2: Нажал "Встал". Только "СЛЕТ".
 def worker_active_kb(num_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")]
@@ -471,7 +485,7 @@ async def cmd_num(message: types.Message, bot: Bot):
     try: await bot.send_message(user_id, f"⚡️ Воркер принял номер {phone}. Ждите код.")
     except: pass
 
-# --- ОБРАБОТЧИК КНОПКИ "ВСТАЛ" (ПЕРЕХОД НА ЭТАП 2) ---
+# --- ОБРАБОТЧИК КНОПКИ "ВСТАЛ" (ЭТАП 2 - ПЕРЕХОД К "СЛЕТ") ---
 @router.callback_query(F.data.startswith("w_act_"))
 async def worker_activate(c: CallbackQuery, bot: Bot):
     num_id = c.data.split('_')[2]
@@ -485,7 +499,7 @@ async def worker_activate(c: CallbackQuery, bot: Bot):
         await c.answer("🚫 Это чужой номер!", show_alert=True)
         return
         
-    # Просто меняем сообщение на "СЛЕТ" и даем кнопку "СЛЕТ"
+    # Меняем сообщение на "СЛЕТ", кнопка одна: СЛЕТ
     await c.message.edit_text(f"СЛЕТ\n📱 {phone}", reply_markup=worker_active_kb(num_id))
 
 # --- ОБРАБОТЧИК ФИНАЛА (СЛЕТ или ОШИБКА) ---
@@ -519,8 +533,40 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
     try: await bot.send_message(u, f"{m}\n📱 {p}")
     except: pass
 
-# --- SMS HANDLER (ТОЛЬКО ТЕКСТ) ---
-@router.message(Command("sms"), F.text)
+# --- SMS HANDLER (ФОТО) - СТОИТ ПЕРВЫМ! ---
+@router.message(F.photo)
+async def sms_photo_handler(m: types.Message, bot: Bot):
+    # Если нет подписи или она не начинается с /sms - игнорируем, пусть обрабатывают другие хендлеры (если есть)
+    if not m.caption or not m.caption.startswith("/sms"):
+        return
+
+    try:
+        args = m.caption.split(' ', 2)
+        if len(args) < 2:
+            await m.reply("⚠️ Формат подписи: /sms номер текст")
+            return
+            
+        ph_raw = args[1]
+        tx = args[2] if len(args) > 2 else "Код на фото 👆"
+        ph = clean_phone(ph_raw)
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
+                r = await cur.fetchone()
+                
+        if r:
+            await bot.send_photo(
+                chat_id=r[0], 
+                photo=m.photo[-1].file_id, 
+                caption=f"🔔 SMS / Код (ФОТО)\n📱 {ph}\n💬 {tx}"
+            )
+            await m.react([types.ReactionTypeEmoji(emoji="👍")])
+        else: 
+            await m.reply(f"🚫 Номер {ph} не найден в работе.")
+    except: pass
+
+# --- SMS HANDLER (ТЕКСТ) ---
+@router.message(Command("sms"))
 async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     if not command.args: 
         await m.reply("⚠️ Формат: /sms номер текст")
@@ -540,32 +586,6 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
             await m.reply(f"🚫 Номер {ph} не найден в работе.")
-    except: pass
-
-# --- SMS HANDLER (ПЕРЕСЫЛКА ФОТО) ---
-@router.message(F.photo, F.caption.startswith("/sms"))
-async def sms_photo_handler(m: types.Message, bot: Bot):
-    try:
-        args = m.caption.split(' ', 2)
-        if len(args) < 2: return
-            
-        ph_raw = args[1]
-        tx = args[2] if len(args) > 2 else "Код на фото выше 👆"
-        ph = clean_phone(ph_raw)
-        
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT user_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur: 
-                r = await cur.fetchone()
-                
-        if r:
-            await bot.send_photo(
-                chat_id=r[0], 
-                photo=m.photo[-1].file_id, 
-                caption=f"🔔 SMS / Код (ФОТО)\n📱 {ph}\n💬 {tx}"
-            )
-            await m.react([types.ReactionTypeEmoji(emoji="👍")])
-        else: 
-            await m.reply(f"🚫 Номер {ph} не найден.")
     except: pass
 
 # --- АДМИН ПАНЕЛЬ ---
@@ -625,6 +645,7 @@ async def adm_report(c: CallbackQuery):
     text = f"📅 ОТЧЕТ ({date.today()})\n\n"
     
     async with aiosqlite.connect(DB_NAME) as db:
+        # В отчет идут только finished. Если нужно добавить drop, измени статус в запросе
         async with db.execute("SELECT phone, tariff_price FROM numbers WHERE status='finished' AND end_time >= ?", (ts,)) as cur: 
             rows = await cur.fetchall()
             
@@ -741,16 +762,32 @@ async def adm_cls(c: CallbackQuery):
 # --- ЗАПУСК ---
 async def main():
     if not TOKEN: 
-        print("❌ TOKEN?")
+        print("❌ ОШИБКА: Токен не найден! Пропиши TOKEN в коде или в .env")
         return
         
     await init_db()
+    
+    # Настройка Хранилища (Redis или Memory)
+    if HAS_REDIS and os.getenv("REDIS_URL"):
+        # Если есть библиотека redis И есть ссылка на редис в .env
+        redis_url = os.getenv("REDIS_URL")
+        storage = RedisStorage.from_url(redis_url)
+        print("🟢 Подключен REDIS для хранения состояний!")
+    else:
+        # Иначе используем оперативную память (работает всегда)
+        storage = MemoryStorage()
+        print("🟡 Redis не найден или не настроен. Используется RAM (MemoryStorage).")
+        print("   -> Основная база SQLite работает и сохраняется в файл.")
+
     bot = Bot(token=TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(storage=storage)
     dp.include_router(router)
     
-    print("🚀 v25.2 FULL FIX STARTED")
+    print("🚀 v26.0 FINAL STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")
