@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramBadRequest
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v24.db"
+DB_NAME = "fast_team_v25.db" 
 MSK_OFFSET = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -151,11 +151,19 @@ def method_select_kb():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]
     ])
 
-def worker_finish_kb(num_id): 
+# --- НОВЫЕ КЛАВИАТУРЫ ВОРКЕРА (СТРОГО ПО ТЗ) ---
+
+# 1. Сразу после выдачи: ТОЛЬКО "ВСТАЛ" и "ОШИБКА"
+def worker_initial_kb(num_id): 
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Встал", callback_data=f"w_fin_{num_id}"), 
-         InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")],
-        [InlineKeyboardButton(text="❌ ОШИБКА", callback_data=f"w_err_{num_id}")]
+        [InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{num_id}"), 
+         InlineKeyboardButton(text="Ошибка ❌", callback_data=f"w_err_{num_id}")]
+    ])
+
+# 2. После нажатия "Встал": ТОЛЬКО КНОПКА "СЛЕТ" (выплаты нет)
+def worker_active_kb(num_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")]
     ])
 
 def admin_kb():
@@ -410,7 +418,7 @@ async def set_topic(c: CallbackQuery):
                   f"3. Нажимайте кнопки только на своем номере!")
     await c.message.edit_text(guide_text)
 
-# --- КОМАНДА /NUM ---
+# --- КОМАНДА /NUM (ПЕРВЫЙ ЭТАП) ---
 @router.message(Command("num"))
 async def cmd_num(message: types.Message, bot: Bot):
     chat_id = message.chat.id
@@ -443,21 +451,41 @@ async def cmd_num(message: types.Message, bot: Bot):
 
     m_icon = "📷 QR" if method == 'qr' else "💬 SMS"
     text = (f"🚀 В РАБОТЕ\n"
-            f"📱 `{phone}`\n"
+            f"📱 {phone}\n"
             f"💰 {t_res[0]} | {price}\n"
             f"⏳ {hold} | {m_icon}\n\n"
-            f"Код: `/sms {phone} код`")
+            f"Код: /sms {phone} код")
             
-    msg = await message.answer(text, parse_mode="Markdown", reply_markup=worker_finish_kb(num_id))
+    msg = await message.answer(text, reply_markup=worker_initial_kb(num_id))
     
     async with aiosqlite.connect(DB_NAME) as db: 
         await db.execute("UPDATE numbers SET worker_msg_id = ? WHERE id = ?", (msg.message_id, num_id))
         await db.commit()
         
-    try: await bot.send_message(user_id, f"⚡️ Воркер принял номер `{phone}`. Ждите код.")
+    try: await bot.send_message(user_id, f"⚡️ Воркер принял номер {phone}. Ждите код.")
     except: pass
 
-@router.callback_query(F.data.startswith("w_fin_") | F.data.startswith("w_drop_") | F.data.startswith("w_err_"))
+# --- ОБРАБОТЧИК КНОПКИ "ВСТАЛ" (ПЕРЕХОД НА ВТОРОЙ ЭТАП) ---
+@router.callback_query(F.data.startswith("w_act_"))
+async def worker_activate(c: CallbackQuery, bot: Bot):
+    num_id = c.data.split('_')[2]
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT worker_id, phone FROM numbers WHERE id = ?", (num_id,)) as cur: 
+            res = await cur.fetchone()
+            owner_id, phone = res if res else (None, None)
+
+    if owner_id != c.from_user.id and c.from_user.id != ADMIN_ID:
+        await c.answer("🚫 Это чужой номер!", show_alert=True)
+        return
+        
+    # Просто меняем сообщение на "СЛЕТ" и даем кнопку "СЛЕТ", без выплаты.
+    # Статус в базе можно оставить 'work' или сменить на 'active', для логики это не критично, но пусть будет work.
+    
+    await c.message.edit_text(f"СЛЕТ\n📱 {phone}", reply_markup=worker_active_kb(num_id))
+
+# --- ОБРАБОТЧИК ФИНАЛА (СЛЕТ или ОШИБКА) ---
+@router.callback_query(F.data.startswith("w_drop_") | F.data.startswith("w_err_"))
 async def worker_fin_secure(c: CallbackQuery, bot: Bot):
     num_id = c.data.split('_')[2]
     
@@ -470,39 +498,28 @@ async def worker_fin_secure(c: CallbackQuery, bot: Bot):
         await c.answer("🚫 Это чужой номер!", show_alert=True)
         return
 
-    # ЛОГИКА СТАТУСОВ И СООБЩЕНИЙ
-    if "w_fin_" in c.data: 
-        status_db = "finished"
-        msg_header = "✅ ВЫПЛАТА (ВСТАЛ)"
-        msg_user = "💰 Оплата начислена!"
-    elif "w_drop_" in c.data: 
-        status_db = "drop"
-        msg_header = "📉 СЛЕТ (БАН/ОТМЕНА)"
-        msg_user = "📉 Номер слетел / забанен."
+    if "w_drop_" in c.data: 
+        s, m = "drop", "📉 Номер слетел."
     else: 
-        status_db = "dead"
-        msg_header = "❌ ОШИБКА"
-        msg_user = "❌ Произошла ошибка."
+        s, m = "dead", "❌ Ошибка."
     
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE numbers SET status = ?, end_time = ? WHERE id = ?", (status_db, datetime.utcnow().isoformat(), num_id))
+        await db.execute("UPDATE numbers SET status = ?, end_time = ? WHERE id = ?", (s, datetime.utcnow().isoformat(), num_id))
         async with db.execute("SELECT phone, user_id FROM numbers WHERE id = ?", (num_id,)) as cur: 
             res = await cur.fetchone()
             p, u = res if res else (None, None)
         await db.commit()
 
-    # Финальное сообщение в чат воркеров
-    await c.message.edit_text(f"{msg_header}\n📱 `{p}`\n👤 Воркер: {c.from_user.first_name}", parse_mode="Markdown")
-    
-    # Уведомление юзеру
-    try: await bot.send_message(u, f"{msg_user}\n📱 `{p}`")
+    # Финальное сообщение без кавычек
+    await c.message.edit_text(f"Финал {s}: {p}\n👤 Воркер: {c.from_user.first_name}")
+    try: await bot.send_message(u, f"{m}\n📱 {p}")
     except: pass
 
 # --- SMS HANDLER (ТЕКСТ) ---
 @router.message(Command("sms"))
 async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
     if not command.args: 
-        await m.reply("⚠️ Формат: `/sms номер текст`")
+        await m.reply("⚠️ Формат: /sms номер текст")
         return
     try:
         args = command.args.split(' ', 1)
@@ -519,7 +536,7 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
                 r = await cur.fetchone()
                 
         if r and (r[1] == m.from_user.id or m.from_user.id == ADMIN_ID):
-            await bot.send_message(r[0], f"🔔 SMS / Код\n📱 `{ph}`\n💬 `{tx}`", parse_mode="Markdown")
+            await bot.send_message(r[0], f"🔔 SMS / Код\n📱 {ph}\n💬 {tx}")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
             await m.reply(f"🚫 Номер {ph} не найден или вы не его воркер.")
@@ -530,10 +547,9 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
 @router.message(F.photo & F.caption.startswith("/sms"))
 async def sms_photo_handler(m: types.Message, bot: Bot):
     try:
-        # Разбиваем caption: "/sms +7999 текст"
         args = m.caption.split(' ', 2)
         if len(args) < 2:
-            await m.reply("⚠️ Формат: `/sms номер текст` (с фото)")
+            await m.reply("⚠️ Формат: /sms номер текст (с фото)")
             return
             
         ph_raw = args[1]
@@ -549,7 +565,7 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
                 r = await cur.fetchone()
                 
         if r and (r[1] == m.from_user.id or m.from_user.id == ADMIN_ID):
-            await bot.send_photo(r[0], m.photo[-1].file_id, caption=f"🔔 SMS / Код\n📱 `{ph}`\n💬 `{tx}`", parse_mode="Markdown")
+            await bot.send_photo(r[0], m.photo[-1].file_id, caption=f"🔔 SMS / Код\n📱 {ph}\n💬 {tx}")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else: 
             await m.reply(f"🚫 Номер {ph} не найден или вы не его воркер.")
@@ -625,7 +641,7 @@ async def adm_report(c: CallbackQuery):
     for r in rows:
         val = extract_price(r[1])
         total += val
-        text += f"✅ `{r[0]}` | {r[1]}\n"
+        text += f"✅ {r[0]} | {r[1]}\n"
         
     text += f"\n💵 ИТОГО: {total}$"
     
@@ -737,7 +753,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     
-    print("🚀 v24.3 PHOTO & MESSAGE FIX STARTED")
+    print("🚀 v25.1 STRICT LOGIC STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__": 
