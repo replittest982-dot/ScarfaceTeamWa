@@ -19,9 +19,9 @@ from aiogram.exceptions import TelegramBadRequest
 TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v27_3.db" # Новая версия базы для новых полей
+DB_NAME = "fast_team_v27_5.db" # Свежая база
+REF_PERCENT = 0.05  # 5% реферальных
 
-# Логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
@@ -38,7 +38,7 @@ class AdminState(StatesGroup):
 # --- DATABASE INIT ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Юзеры + Рефералка
+        # Юзеры (с рефералкой)
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, 
             username TEXT, 
@@ -47,7 +47,7 @@ async def init_db():
             referrer_id INTEGER, 
             reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         
-        # Номера + start_time (для подсчета времени жизни)
+        # Номера (с таймингами)
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             user_id INTEGER, 
@@ -62,16 +62,10 @@ async def init_db():
             end_time TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             
-        await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            name TEXT UNIQUE, 
-            price TEXT, 
-            hold_info TEXT)""")
-            
+        await db.execute("CREATE TABLE IF NOT EXISTS tariffs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, price TEXT, hold_info TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        
         await db.commit()
-        logging.info("🚀 FAST TEAM BOT v27.3 STARTED & DB CONNECTED")
+        logging.info("🚀 FAST TEAM BOT v27.5 READY")
 
 # --- UTILS ---
 def clean_phone(phone: str):
@@ -82,17 +76,14 @@ def clean_phone(phone: str):
     return clean if re.match(r'^\+\d{10,15}$', clean) else None
 
 def extract_price_float(price_str):
-    """Вытаскивает число из строки типа '500$' или '2.5 USD'"""
+    """Чистит цену от $ и букв для математики"""
     if not price_str: return 0.0
-    # Оставляем только цифры и точку
     clean = re.sub(r'[^\d.]', '', str(price_str))
-    try:
-        return float(clean)
-    except ValueError:
-        return 0.0
+    try: return float(clean)
+    except: return 0.0
 
 def calculate_duration(start_iso, end_iso):
-    """Считает разницу во времени красиво"""
+    """Считает сколько номер простоял"""
     if not start_iso or not end_iso: return "Неизвестно"
     try:
         s = datetime.fromisoformat(start_iso)
@@ -103,13 +94,13 @@ def calculate_duration(start_iso, end_iso):
         minutes, _ = divmod(remainder, 60)
         
         if diff.days > 0:
-            return f"{diff.days} д. {hours} ч."
+            return f"{diff.days}д {hours}ч"
         elif hours > 0:
-            return f"{hours} ч. {minutes} мин."
+            return f"{hours}ч {minutes}м"
         else:
-            return f"{minutes} мин."
+            return f"{minutes} мин"
     except:
-        return "Ошибка времени"
+        return "-"
 
 # --- KEYBOARDS ---
 def main_menu_kb(user_id: int):
@@ -122,18 +113,7 @@ def main_menu_kb(user_id: int):
         kb.append([InlineKeyboardButton(text="⚡️ ADMIN PANEL", callback_data="admin_panel_start")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def worker_initial_kb(num_id): 
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{num_id}"), 
-        InlineKeyboardButton(text="Ошибка ❌", callback_data=f"w_err_{num_id}")
-    ]])
-
-def worker_active_kb(num_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{num_id}")
-    ]])
-
-# --- WORKER: PHOTO & SMS HANDLERS ---
+# --- WORKER: PHOTO & SMS ---
 @router.message(F.photo)
 async def sms_photo_handler(m: types.Message, bot: Bot):
     if not m.caption: return
@@ -148,7 +128,7 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
         tx = parts[2] if len(parts) > 2 else "Вход в аккаунт 👆"
         
         ph = clean_phone(ph_raw)
-        if not ph: return await m.reply(f"❌ Неверный номер: {ph_raw}")
+        if not ph: return await m.reply(f"❌ Кривой номер: {ph_raw}")
 
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT user_id FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,)) as cur:
@@ -158,10 +138,10 @@ async def sms_photo_handler(m: types.Message, bot: Bot):
             await bot.send_photo(chat_id=r[0], photo=m.photo[-1].file_id, caption=f"🔔 **SMS / КОД**\n📱 `{ph}`\n💬 {tx}", parse_mode="Markdown")
             await m.react([types.ReactionTypeEmoji(emoji="👍")])
         else:
-            await m.reply(f"🚫 Номер {ph} не найден в работе.")
+            await m.reply(f"🚫 Номер {ph} не в работе.")
     except Exception as e:
         logging.error(f"Error photo: {e}")
-        await m.reply("❌ Ошибка отправки фото.")
+        await m.reply("❌ Ошибка отправки.")
 
 @router.message(Command("sms"))
 async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
@@ -220,7 +200,7 @@ async def stop_work(message: types.Message):
     await message.answer("🛑 Топик отвязан.")
 
 @router.message(Command("num"))
-async def cmd_num(message: types.Message, bot: Bot):
+async def cmd_num(message: types.Message):
     cid = message.chat.id
     tid = message.message_thread_id if message.is_topic_message else 0
     
@@ -240,8 +220,11 @@ async def cmd_num(message: types.Message, bot: Bot):
         await db.commit()
     
     await message.answer(
-        f"🚀 **В РАБОТЕ**\n📱 `{row[2]}`\n💰 {t_res[0]} | {row[3]}", 
-        reply_markup=worker_initial_kb(row[0]), 
+        f"🚀 **В РАБОТЕ**\n📱 `{row[2]}`\n💰 {t_res[0]}", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Встал ✅", callback_data=f"w_act_{row[0]}"), 
+            InlineKeyboardButton(text="Ошибка ❌", callback_data=f"w_err_{row[0]}")
+        ]]), 
         parse_mode="Markdown"
     )
 
@@ -254,7 +237,12 @@ async def worker_activate(c: CallbackQuery):
             res = await cur.fetchone()
         await db.commit()
     
-    await c.message.edit_text(f"📉 **СЛЕТ**\n📱 `{res[0]}`", reply_markup=worker_active_kb(nid), parse_mode="Markdown")
+    # Меняем сообщение, чтобы не спамить
+    await c.message.edit_text(
+        f"📉 **СЛЕТ**\n📱 `{res[0]}`", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📉 СЛЕТ", callback_data=f"w_drop_{nid}")]]), 
+        parse_mode="Markdown"
+    )
 
 @router.callback_query(F.data.startswith("w_drop_") | F.data.startswith("w_err_"))
 async def worker_fin(c: CallbackQuery, bot: Bot):
@@ -263,10 +251,25 @@ async def worker_fin(c: CallbackQuery, bot: Bot):
     now_iso = datetime.now(timezone.utc).isoformat()
     
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT phone, user_id, start_time FROM numbers WHERE id=?", (nid,)) as cur: 
+        async with db.execute("SELECT phone, user_id, start_time, tariff_price FROM numbers WHERE id=?", (nid,)) as cur: 
             res = await cur.fetchone()
             
         await db.execute("UPDATE numbers SET status=?, end_time=? WHERE id=?", (st, now_iso, nid))
+        
+        # ЛОГИКА РЕФЕРАЛКИ 5%
+        if st == "drop":
+            async with db.execute("SELECT referrer_id FROM users WHERE user_id=?", (res[1],)) as cur:
+                ref_data = await cur.fetchone()
+            
+            if ref_data and ref_data[0]:
+                ref_id = ref_data[0]
+                price_val = extract_price_float(res[3])
+                reward = round(price_val * REF_PERCENT, 3)
+                if reward > 0:
+                    try: 
+                        await bot.send_message(ref_id, f"💰 **Реферальный бонус!**\nТвой реферал сдал номер `{res[0]}`.\nНачислено: **{reward}$** (5%)", parse_mode="Markdown")
+                    except: pass
+
         await db.commit()
     
     status_text = "СЛЕТ (Ожидает выплаты)" if st == "drop" else "ОШИБКА"
@@ -275,7 +278,7 @@ async def worker_fin(c: CallbackQuery, bot: Bot):
     # Уведомляем юзера с таймером
     try:
         duration_msg = ""
-        if st == "drop" and res[2]: # Если есть start_time
+        if st == "drop" and res[2]: 
              duration = calculate_duration(res[2], now_iso)
              duration_msg = f"\n⏱ **Простоял:** {duration}"
              
@@ -286,7 +289,7 @@ async def worker_fin(c: CallbackQuery, bot: Bot):
 # --- USER COMMANDS ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
-    # Логика рефералки
+    # Логика рефералки из ссылки /start 123
     referrer_id = None
     if command.args and command.args.isdigit():
         rid = int(command.args)
@@ -304,15 +307,15 @@ async def cmd_start(message: types.Message, command: CommandObject):
             )
             await db.commit()
             
-            # Уведомляем админа
-            try: await message.bot.send_message(ADMIN_ID, f"👤 Новый запрос: {message.from_user.id} (@{message.from_user.username})\nПригласил: {referrer_id if referrer_id else 'Никто'}", 
+            # Админу
+            try: await message.bot.send_message(ADMIN_ID, f"👤 Новый запрос: {message.from_user.id} (@{message.from_user.username})\nRef: {referrer_id or 'Net'}", 
                                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                                                     InlineKeyboardButton(text="✅", callback_data=f"acc_ok_{message.from_user.id}"), 
                                                     InlineKeyboardButton(text="🚫", callback_data=f"acc_no_{message.from_user.id}")
                                                 ]]))
             except: pass
             
-            # Уведомляем реферера
+            # Рефереру
             if referrer_id:
                 try: await message.bot.send_message(referrer_id, f"🤝 У вас новый реферал: @{message.from_user.username}")
                 except: pass
@@ -345,9 +348,6 @@ async def show_profile(c: CallbackQuery, bot: Bot):
         async with db.execute("SELECT COUNT(*), SUM(CAST(tariff_price AS REAL)) FROM numbers WHERE user_id=? AND status='drop'", (uid,)) as cur:
             stats = await cur.fetchone()
             count = stats[0] or 0
-            # Исправляем подсчет, если в базе мусор, но extract_price_float решает это при отчетах, здесь SQL CAST может сбоить если там '$'. 
-            # Для профиля лучше упростить или хранить чистые числа. В новой базе всё будет чисто.
-            money = stats[1] or 0.0 
             
         # Количество рефералов
         async with db.execute("SELECT COUNT(*) FROM users WHERE referrer_id=?", (uid,)) as cur:
@@ -365,8 +365,7 @@ async def show_profile(c: CallbackQuery, bot: Bot):
         f"👥 Приглашено: **{ref_count} чел.**\n"
         f"🔗 Твоя ссылка:\n`{ref_link}`\n\n"
         f"📊 **Статистика:**\n"
-        f"✅ Сдано: **{count}**\n"
-        f"💰 Профит: **{money}$**"
+        f"✅ Сдано: **{count}**"
     )
     await c.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_kb(uid))
 
@@ -388,7 +387,7 @@ async def my_numbers_menu(c: CallbackQuery):
     if not active_rows: text += "— Пусто —\n"
     for r in active_rows:
         st_icon = "⏳" if r[1] == 'queue' else "⚙️" if r[1] == 'work' else "🔥"
-        text += f"{st_icon} `{r[0]}` ({r[2]})\n"
+        text += f"{st_icon} `{r[0]}`\n"
         
     text += "\n📜 **История (последние 5):**\n"
     if not history_rows: text += "— Пусто —\n"
