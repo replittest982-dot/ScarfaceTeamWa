@@ -20,13 +20,15 @@ from aiogram.exceptions import TelegramBadRequest
 TOKEN = os.getenv("BOT_TOKEN") 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v28.db" 
+DB_NAME = "fast_team_v28_2.db" 
 REF_PERCENT = 0.05 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
-# --- STATES ---
+# Хранилище для ID сообщений AFK (чтобы удалять старые)
+last_afk_msg = {} 
+
 class UserState(StatesGroup):
     waiting_for_number = State()
 
@@ -36,56 +38,33 @@ class AdminState(StatesGroup):
     trf_adding_price = State()
     trf_adding_hold = State()
 
-# --- DATABASE INIT ---
+# --- DATABASE ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Юзеры (добавили is_banned)
         await db.execute("""CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, 
-            username TEXT, 
-            first_name TEXT, 
-            is_approved INTEGER DEFAULT 0, 
-            is_banned INTEGER DEFAULT 0,
-            referrer_id INTEGER, 
-            reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, 
+            is_approved INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0,
+            referrer_id INTEGER, reg_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         
-        # Номера
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            user_id INTEGER, 
-            phone TEXT, 
-            method TEXT, 
-            tariff_name TEXT, 
-            tariff_price TEXT, 
-            tariff_hold TEXT, 
-            status TEXT, 
-            worker_id INTEGER, 
-            start_time TIMESTAMP,
-            end_time TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, 
+            method TEXT, tariff_name TEXT, tariff_price TEXT, tariff_hold TEXT, 
+            status TEXT, worker_id INTEGER, start_time TIMESTAMP,
+            end_time TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             
         await db.execute("CREATE TABLE IF NOT EXISTS tariffs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, price TEXT, hold_info TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        
-        # Статус ворка по умолчанию ON
         await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('work_status', 'on')")
-        
         await db.commit()
-        logging.info("🚀 FAST TEAM BOT v28.0 (FINAL) STARTED")
+        logging.info("🚀 FAST TEAM BOT v28.2 STARTED")
 
 # --- UTILS ---
 def clean_phone(phone: str):
-    # Жесткий фильтр. Оставляем только цифры.
-    # Если начинается с 8 -> меняем на +7
-    # Если с 7 -> +7
-    # Если 9... (10 цифр) -> +79...
     clean = re.sub(r'[^\d]', '', str(phone))
-    
     if len(clean) == 11:
         if clean.startswith('8'): clean = '7' + clean[1:]
     elif len(clean) == 10:
         clean = '7' + clean
-        
     if len(clean) >= 11 and len(clean) <= 15:
         return '+' + clean
     return None
@@ -120,18 +99,49 @@ async def is_banned(user_id):
             res = await cur.fetchone()
             return res and res[0] == 1
 
+# --- BACKGROUND TASK (ANTI-AFK) ---
+async def anti_afk_task(bot: Bot):
+    while True:
+        await asyncio.sleep(300) # 5 минут = 300 секунд
+        
+        # Получаем все чаты, где настроен бот
+        active_chats = []
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT key FROM config WHERE key LIKE 'group_cfg_%'") as cur:
+                rows = await cur.fetchall()
+                for r in rows:
+                    try:
+                        chat_id = int(r[0].replace('group_cfg_', ''))
+                        active_chats.append(chat_id)
+                    except: pass
+        
+        # Рассылаем "Вы тут?"
+        for chat_id in active_chats:
+            try:
+                # Удаляем старое сообщение
+                if chat_id in last_afk_msg:
+                    try: await bot.delete_message(chat_id, last_afk_msg[chat_id])
+                    except: pass
+                
+                # Шлем новое
+                if await check_work_status(): # Только если ворк включен
+                    msg = await bot.send_message(chat_id, "🟢 **Воркеры, вы тут?**\nНе спим, разбираем очередь! 🚀", parse_mode="Markdown")
+                    last_afk_msg[chat_id] = msg.message_id
+            except Exception as e:
+                logging.error(f"AFK Error in {chat_id}: {e}")
+
 # --- KEYBOARDS ---
 def main_menu_kb(user_id: int):
     kb = [
         [InlineKeyboardButton(text="📥 Сдать номер", callback_data="select_tariff")],
-        [InlineKeyboardButton(text="🗂 Мои номера", callback_data="my_numbers_menu"), InlineKeyboardButton(text="📊 Очередь", callback_data="public_queue")],
+        [InlineKeyboardButton(text="🗂 Мои номера / Удалить", callback_data="my_numbers_menu"), InlineKeyboardButton(text="📊 Очередь", callback_data="public_queue")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile"), InlineKeyboardButton(text="ℹ️ Помощь", callback_data="menu_guide")]
     ]
     if user_id == ADMIN_ID:
         kb.append([InlineKeyboardButton(text="⚡️ ADMIN PANEL", callback_data="admin_panel_start")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- WORKER: PHOTO & SMS ---
+# --- WORKER HANDLERS ---
 @router.message(F.photo)
 async def sms_photo_handler(m: types.Message, bot: Bot):
     if not m.caption: return
@@ -171,7 +181,6 @@ async def sms_text_handler(m: types.Message, command: CommandObject, bot: Bot):
         else: await m.reply(f"🚫 Номер {ph} не в работе.")
     except: pass
 
-# --- ADMIN: SETUP GROUP & SWITCH ---
 @router.message(Command("startwork"))
 async def worker_setup(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
@@ -194,7 +203,6 @@ async def set_group_tariff(c: CallbackQuery):
         await db.commit()
     
     await c.message.delete()
-    # ТУТОРИАЛ
     await c.message.answer(
         f"✅ **Группа привязана!**\n💎 Тариф: **{t_name}**\n\n"
         f"📋 **ПАМЯТКА ВОРКЕРА:**\n"
@@ -206,6 +214,8 @@ async def set_group_tariff(c: CallbackQuery):
 
 @router.message(Command("num"))
 async def cmd_num(message: types.Message):
+    if not await check_work_status(): return await message.reply("⛔️ Ворк на паузе.")
+    
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM config WHERE key=?", (f"group_cfg_{message.chat.id}",)) as cur: t_res = await cur.fetchone()
         if not t_res: return 
@@ -269,24 +279,19 @@ async def worker_fin(c: CallbackQuery, bot: Bot):
         await bot.send_message(res[1], msg, parse_mode="Markdown")
     except: pass
 
-# --- USER COMMANDS ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
     if await is_banned(message.from_user.id): return
-    
     referrer_id = None
-    if command.args and command.args.isdigit():
-        rid = int(command.args)
-        if rid != message.from_user.id: referrer_id = rid
+    if command.args and command.args.isdigit() and int(command.args) != message.from_user.id:
+        referrer_id = int(command.args)
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT is_approved FROM users WHERE user_id = ?", (message.from_user.id,)) as c: res = await c.fetchone()
-        
         if not res:
             await db.execute("INSERT INTO users (user_id, username, first_name, is_approved, referrer_id) VALUES (?, ?, ?, 0, ?)", 
                              (message.from_user.id, message.from_user.username, message.from_user.first_name, referrer_id))
             await db.commit()
-            
             try: await message.bot.send_message(ADMIN_ID, f"👤 Запрос: {message.from_user.id} (@{message.from_user.username})\nRef: {referrer_id}", 
                                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                                                     InlineKeyboardButton(text="✅", callback_data=f"acc_ok_{message.from_user.id}"), 
@@ -295,14 +300,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
             return await message.answer("🔒 Ожидайте подтверждения.")
             
     if res[0] == 1: 
-        # КРАСИВОЕ ПРИВЕТСТВИЕ
-        welcome_text = (
-            f"👋 **Привет, {message.from_user.first_name}!**\n\n"
-            f"🚀 **FAST TEAM** — лучший сервис скупа.\n"
-            f"🛡 Гарантия выплат и скорости.\n\n"
-            f"👇 Жми меню для работы!"
-        )
-        await message.answer(welcome_text, reply_markup=main_menu_kb(message.from_user.id), parse_mode="Markdown")
+        await message.answer(f"👋 **Привет, {message.from_user.first_name}!**\n🚀 Добро пожаловать в FAST TEAM.", reply_markup=main_menu_kb(message.from_user.id), parse_mode="Markdown")
     else: await message.answer("⏳ Доступ закрыт.")
 
 @router.callback_query(F.data == "menu_profile")
@@ -334,7 +332,7 @@ async def my_numbers_menu(c: CallbackQuery):
     text += "\n📜 **История:**\n" + ("— Пусто —\n" if not history_rows else "".join([f"{'✅' if r[1]=='drop' else '❌'} `{r[0]}` | {calculate_duration(r[2], r[3])}\n" for r in history_rows]))
 
     kb = []
-    if queue_rows: kb.append([InlineKeyboardButton(text="🗑 Отменить (Очередь)", callback_data="cancel_queue_menu")])
+    if queue_rows: kb.append([InlineKeyboardButton(text="🗑 Удалить номер (Из очереди)", callback_data="cancel_queue_menu")])
     kb.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="my_numbers_menu")])
     kb.append([InlineKeyboardButton(text="🔙 Меню", callback_data="nav_main")])
     await c.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -344,10 +342,10 @@ async def cancel_queue_menu(c: CallbackQuery):
     uid = c.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT id, phone FROM numbers WHERE user_id=? AND status='queue'", (uid,)) as cur: rows = await cur.fetchall()
-    if not rows: return await c.answer("Нечего отменять.")
-    kb = [[InlineKeyboardButton(text=f"❌ {r[1]}", callback_data=f"del_num_{r[0]}")] for r in rows]
+    if not rows: return await c.answer("Нечего удалять.")
+    kb = [[InlineKeyboardButton(text=f"❌ Удалить {r[1]}", callback_data=f"del_num_{r[0]}")] for r in rows]
     kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="my_numbers_menu")])
-    await c.message.edit_text("🗑 **Удаление:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await c.message.edit_text("🗑 **Выберите номер для удаления:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
 
 @router.callback_query(F.data.startswith("del_num_"))
 async def delete_number(c: CallbackQuery):
@@ -357,19 +355,16 @@ async def delete_number(c: CallbackQuery):
     await c.answer("Удалено!")
     await my_numbers_menu(c)
 
-# --- TARIFF & ADD NUMBER ---
 @router.callback_query(F.data == "select_tariff")
 async def step_tariff(c: CallbackQuery):
     if await is_banned(c.from_user.id): return await c.answer("🚫 Вы забанены")
     if not await check_work_status(): return await c.answer("⛔️ Ворк на паузе.", show_alert=True)
-
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT name FROM tariffs") as cur: rows = await cur.fetchall()
-    
     if not rows: return await c.answer("Нет тарифов", show_alert=True)
     kb = [[InlineKeyboardButton(text=r[0], callback_data=f"trf_pick_{r[0]}")] for r in rows]
     kb.append([InlineKeyboardButton(text="🔙 Меню", callback_data="nav_main")])
-    await c.message.edit_text("👇 **Выберите тариф:**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await c.message.edit_text("👇 **Выберите сервис:**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data.startswith("trf_pick_"))
 async def step_method(c: CallbackQuery, state: FSMContext):
@@ -384,7 +379,7 @@ async def step_method(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.in_({"input_sms", "input_qr"}))
 async def step_input(c: CallbackQuery, state: FSMContext):
     await state.update_data(method='sms' if c.data == "input_sms" else 'qr')
-    await c.message.edit_text("📱 **Введите номера (списком):**\n(Мусор удалится автоматически)", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]]))
+    await c.message.edit_text("📱 **Введите номера (списком):**\n", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="nav_main")]]))
     await state.set_state(UserState.waiting_for_number)
 
 @router.message(UserState.waiting_for_number)
@@ -396,19 +391,41 @@ async def receive_number(message: types.Message, state: FSMContext):
     d = await state.get_data()
     raw = message.text.replace(',', '\n').split('\n')
     added = 0
+    errors = 0
     async with aiosqlite.connect(DB_NAME) as db:
         for line in raw:
-            p = clean_phone(line.strip()) # АВТО-ОЧИСТКА
+            p = clean_phone(line.strip())
             if p:
-                await db.execute("INSERT INTO numbers (user_id, phone, method, tariff_name, tariff_price, tariff_hold, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queue', ?)", 
-                                 (message.from_user.id, p, d['method'], d['tariff_name'], d['tariff_price'], d['tariff_hold'], datetime.now(timezone.utc).isoformat()))
-                added += 1
-        await db.commit()
-    await message.answer(f"✅ Принято: **{added}**", reply_markup=main_menu_kb(message.from_user.id), parse_mode="Markdown")
+                # ПРОВЕРКА: Если номер уже в активном статусе - не добавляем
+                async with db.execute("SELECT id FROM numbers WHERE phone=? AND status IN ('queue','work','active')", (p,)) as cur:
+                    exists = await cur.fetchone()
+                
+                if not exists:
+                    await db.execute("INSERT INTO numbers (user_id, phone, method, tariff_name, tariff_price, tariff_hold, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queue', ?)", 
+                                     (message.from_user.id, p, d['method'], d['tariff_name'], d['tariff_price'], d['tariff_hold'], datetime.now(timezone.utc).isoformat()))
+                    added += 1
+                else:
+                    errors += 1
+    
+    await db.commit()
+    msg = f"✅ Принято: **{added}**"
+    if errors > 0: msg += f"\n🚫 Отклонено (уже в работе): {errors}"
+    await message.answer(msg, reply_markup=main_menu_kb(message.from_user.id), parse_mode="Markdown")
     await state.clear()
 
 @router.callback_query(F.data == "nav_main")
 async def nav_main(c: CallbackQuery): await show_profile(c, c.message.bot)
+
+@router.callback_query(F.data == "public_queue")
+async def public_queue_view(c: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT tariff_name, COUNT(*) FROM numbers WHERE status='queue' GROUP BY tariff_name") as cur: stats = await cur.fetchall()
+    text = "📊 **Общая очередь:**\n\n" + ("📭 Пусто" if not stats else "\n".join([f"🔹 {t}: **{c}** шт." for t, c in stats]))
+    await c.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")]]))
+
+@router.callback_query(F.data == "menu_guide")
+async def show_guide(c: CallbackQuery):
+    await c.message.edit_text("ℹ️ **Помощь**\nСдавай номера, получай выплаты.", parse_mode="Markdown", reply_markup=main_menu_kb(c.from_user.id))
 
 # --- ADMIN PANEL ---
 @router.callback_query(F.data == "admin_panel_start")
@@ -419,7 +436,7 @@ async def adm_start(c: CallbackQuery):
         [InlineKeyboardButton(text=f"Ворк: {'🟢' if is_work else '🔴'}", callback_data="adm_toggle_work")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="➕ Тариф", callback_data="adm_trf_add"), InlineKeyboardButton(text="🗑 Тариф", callback_data="adm_trf_del_menu")],
-        [InlineKeyboardButton(text="📄 ОТЧЕТ (CSV)", callback_data="adm_report")],
+        [InlineKeyboardButton(text="📄 ОТЧЕТЫ (2 ФАЙЛА)", callback_data="adm_report")],
         [InlineKeyboardButton(text="🔙 Меню", callback_data="nav_main")]
     ]
     await c.message.edit_text("⚡️ **ADMIN PANEL**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -434,11 +451,10 @@ async def adm_toggle_work(c: CallbackQuery):
         await db.commit()
     await adm_start(c)
 
-# --- BROADCAST ---
 @router.callback_query(F.data == "admin_broadcast")
 async def broadcast_start(c: CallbackQuery, state: FSMContext):
     if c.from_user.id != ADMIN_ID: return
-    await c.message.edit_text("📢 **Отправьте пост для рассылки:**\n(Текст/Фото/Видео)", parse_mode="Markdown")
+    await c.message.edit_text("📢 **Отправьте пост:**", parse_mode="Markdown")
     await state.set_state(AdminState.waiting_for_broadcast)
 
 @router.message(AdminState.waiting_for_broadcast)
@@ -446,9 +462,8 @@ async def broadcast_send(message: types.Message, state: FSMContext, bot: Bot):
     await state.clear()
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users") as cur: users = await cur.fetchall()
-    
     cnt = 0
-    await message.answer(f"🚀 Запуск на {len(users)}...")
+    await message.answer(f"🚀 Запуск...")
     for u in users:
         try:
             await bot.copy_message(u[0], message.chat.id, message.message_id)
@@ -457,46 +472,35 @@ async def broadcast_send(message: types.Message, state: FSMContext, bot: Bot):
         except: pass
     await message.answer(f"✅ Ушло: {cnt}")
 
-# --- REPORT (CSV) ---
 @router.callback_query(F.data == "adm_report")
 async def adm_report(c: CallbackQuery):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""SELECT n.phone, n.start_time, n.end_time, u.username, n.tariff_name, n.tariff_price, n.tariff_hold, n.status 
-                            FROM numbers n JOIN users u ON n.user_id=u.user_id""")
-        rows = await (await db.execute("""SELECT n.phone, n.start_time, n.end_time, u.username, n.tariff_name, n.tariff_price, n.tariff_hold, n.status 
-                            FROM numbers n JOIN users u ON n.user_id=u.user_id""")).fetchall()
-    
-    if not rows: return await c.answer("Пусто")
-    
-    # Генерация CSV как в примере
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    # Заголовки как в твоем файле
-    writer.writerow(["Number", "Duration", "Username", "Rent Group", "Thread", "Start Time", "End Time", "Hold Time", "Hold Price", "Break?", "Stopped?"])
-    
-    for r in rows:
-        dur = calculate_duration(r[1], r[2])
-        # Mapping данных в колонки
-        writer.writerow([
-            r[0], # Number
-            dur,  # Duration
-            r[3] or "NoUser", # Username
-            r[4], # Rent Group (Tariff)
-            "Main", # Thread
-            r[1] or "-", # Start
-            r[2] or "-", # End
-            r[6], # Hold info
-            r[5], # Price
-            "No", # Break
-            "Yes" if r[7] == 'dead' else "No" # Stopped
-        ])
-    
-    buffer.seek(0)
-    # Превращаем в байты для отправки
-    b_data = buffer.getvalue().encode('utf-8-sig') # BOM для Excel
-    await c.message.answer_document(BufferedInputFile(b_data, filename=f"report_{datetime.now().strftime('%Y%m%d')}.csv"), caption="📄 CSV Отчет готов")
+    # Генератор CSV
+    async def get_csv(only_paid=False):
+        where_clause = "WHERE n.status = 'drop'" if only_paid else ""
+        async with aiosqlite.connect(DB_NAME) as db:
+            rows = await (await db.execute(f"""SELECT n.phone, n.start_time, n.end_time, u.username, n.tariff_name, n.tariff_price, n.tariff_hold, n.status 
+                                               FROM numbers n JOIN users u ON n.user_id=u.user_id {where_clause}""")).fetchall()
+        if not rows: return None
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["Number", "Duration", "Username", "Rent Group", "Thread", "Start Time", "End Time", "Hold Time", "Hold Price", "Break?", "Stopped?"])
+        for r in rows:
+            dur = calculate_duration(r[1], r[2])
+            writer.writerow([r[0], dur, r[3] or "NoUser", r[4], "Main", r[1] or "-", r[2] or "-", r[6], r[5], "No", "Yes" if r[7] == 'dead' else "No"])
+        buffer.seek(0)
+        return buffer.getvalue().encode('utf-8-sig')
 
-# --- BAN SYSTEM ---
+    file_paid = await get_csv(only_paid=True)
+    file_full = await get_csv(only_paid=False)
+
+    if file_paid:
+        await c.message.answer_document(BufferedInputFile(file_paid, filename=f"report_PAID_{datetime.now().strftime('%Y%m%d')}.csv"), caption="✅ Оплаченные (Drop)")
+    if file_full:
+        await c.message.answer_document(BufferedInputFile(file_full, filename=f"report_FULL_{datetime.now().strftime('%Y%m%d')}.csv"), caption="📊 Полный отчет")
+    
+    if not file_paid and not file_full:
+        await c.answer("База пуста")
+
 @router.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID or not command.args: return
@@ -571,6 +575,10 @@ async def main():
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    
+    # ЗАПУСК ФОНОВОЙ ЗАДАЧИ AFK
+    asyncio.create_task(anti_afk_task(bot))
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
