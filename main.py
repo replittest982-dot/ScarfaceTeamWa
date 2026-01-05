@@ -21,6 +21,14 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# --- REDIS SETUP (FIXED) ---
+try:
+    from aiogram.fsm.storage.redis import RedisStorage
+    from redis.asyncio import Redis
+    HAS_REDIS = True
+except ImportError:
+    HAS_REDIS = False
+
 # --- CONFIG ---
 try:
     from dotenv import load_dotenv
