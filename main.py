@@ -19,8 +19,9 @@ from aiogram.types import (
     BufferedInputFile, ReactionTypeEmoji
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramForbiddenError
 
-# --- REDIS CHECK ---
+# --- REDIS (Опционально) ---
 try:
     from aiogram.fsm.storage.redis import RedisStorage
     HAS_REDIS = True
@@ -40,7 +41,7 @@ if not TOKEN:
 
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR and ADMIN_ID_STR.isdigit() else None
-DB_NAME = "fast_team_v43.db"
+DB_NAME = "fast_team_v44.db"
 
 # Настройки AFK (в минутах)
 AFK_WARN_MIN = 5
@@ -87,8 +88,8 @@ def clean_phone(phone: str):
     return '+' + clean
 
 def mask_phone(phone, user_id):
-    """Скрывает середину номера для публичных списков"""
-    if user_id == ADMIN_ID: return phone # Админ видит всё
+    """Скрывает середину номера для всех кроме админа и владельца"""
+    if user_id == ADMIN_ID: return phone
     try:
         if len(phone) < 11: return phone
         # +77051234567 -> +7705***4567
@@ -147,7 +148,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs (name, price, hold_info) VALUES ('WhatsApp', '50', '1h'), ('MAX', '150', '2h')")
         await db.commit()
         await refresh_tariffs_cache()
-        logger.info("✅ DB INITIALIZED v43.0")
+        logger.info("✅ DB INITIALIZED v44.0")
 
 # --- KEYBOARDS ---
 def main_menu_kb(user_id):
@@ -180,7 +181,7 @@ def worker_active_kb(num_id):
     return kb.as_markup()
 
 # ==========================================
-# 1. AFK MONITOR
+# 1. AFK MONITOR (ФОНОВЫЙ ПРОЦЕСС)
 # ==========================================
 async def queue_monitor(bot: Bot):
     while True:
@@ -234,13 +235,14 @@ async def cmd_start(m: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("acc_"))
 async def access_logic(c: CallbackQuery, bot: Bot):
-    if c.from_user.id != ADMIN_ID: return
+    if c.from_user.id != ADMIN_ID: return await c.answer("Нет прав")
     act, uid = c.data.split('_')[1], int(c.data.split('_')[2])
     if act == "ok":
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute("UPDATE users SET is_approved=1 WHERE user_id=?", (uid,))
             await db.commit()
-        await bot.send_message(uid, "✅ <b>Доступ открыт!</b>\nЖми /start", parse_mode="HTML")
+        try: await bot.send_message(uid, "✅ <b>Доступ открыт!</b>\nЖми /start", parse_mode="HTML")
+        except: pass
         await c.message.edit_text(f"✅ User {uid} approved")
     else: await c.message.edit_text(f"🚫 User {uid} banned")
 
@@ -367,7 +369,7 @@ async def worker_num(m: types.Message, bot: Bot):
         await db.execute("UPDATE numbers SET status='work', worker_id=?, worker_chat_id=?, worker_thread_id=?, start_time=? WHERE id=?", (m.from_user.id, cid, tid, get_utc_now(), nid))
         await db.commit()
     
-    await m.answer(f"⚡ <b>Номер в работе!</b>\n📱 <code>{ph}</code>\nОжидайте код.", reply_markup=worker_kb(nid, t_name), parse_mode="HTML")
+    await m.answer(f"🚀 <b>Вы взяли номер</b>\n📱 <code>{ph}</code>\n━━━━━━━━━━━━━\nКод: <code>/sms {ph} текст</code>", reply_markup=worker_kb(nid, t_name), parse_mode="HTML")
     try: await bot.send_message(uid, f"⚡ <b>Ваш номер {mask_phone(ph, uid)} взяли!</b>\nОжидайте код.", parse_mode="HTML")
     except: pass
 
@@ -465,15 +467,18 @@ async def msg_handler(m: types.Message, bot: Bot):
                     await m.react([types.ReactionTypeEmoji(emoji="🔥")])
         return
 
-    # 2. ОТВЕТ ЮЗЕРА НА КОД (MAX)
+    # 2. ОТВЕТ ЮЗЕРА НА КОД (MAX) ИЛИ ФОТО (WA)
+    # Если юзер отвечает на сообщение "Офис запросил..."
     if m.reply_to_message and "Офис запросил" in m.reply_to_message.text:
         async with aiosqlite.connect(DB_NAME) as db:
-            sql = "SELECT worker_chat_id, worker_thread_id, phone FROM numbers WHERE user_id=? AND status='work' AND tariff_name LIKE '%MAX%'"
+            # Ищем, кто работает с этим юзером
+            sql = "SELECT worker_chat_id, worker_thread_id, phone FROM numbers WHERE user_id=? AND status='work'"
             async with db.execute(sql, (m.from_user.id,)) as cur: res = await cur.fetchone()
+        
         if res:
             try:
                 content = m.caption or m.text or "[Файл]"
-                header = f"📩 <b>ОТВЕТ ОТ ЮЗЕРА (MAX)</b>\n📱 {res[2]}\n💬 {content}"
+                header = f"📩 <b>ОТВЕТ ОТ ЮЗЕРА</b>\n📱 {res[2]}\n💬 {content}"
                 if m.photo: await bot.send_photo(res[0], m.photo[-1].file_id, caption=header, message_thread_id=res[1], parse_mode="HTML")
                 else: await bot.send_message(res[0], header, message_thread_id=res[1], parse_mode="HTML")
                 await m.answer("✅ Отправлено воркеру.")
@@ -540,10 +545,21 @@ async def profile(c: CallbackQuery):
         async with db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (c.from_user.id,)) as cur: t = (await cur.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=? AND status='finished'", (c.from_user.id,)) as cur: d = (await cur.fetchone())[0]
         
-        # Позиция в очереди
-        async with db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue'") as cur: q_total = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=? AND status='queue'", (c.from_user.id,)) as cur: q_my = (await cur.fetchone())[0]
-        
+        # Позиция в очереди (сколько людей перед тобой)
+        # Ищем ID первой заявки юзера в статусе queue
+        async with db.execute("SELECT id FROM numbers WHERE user_id=? AND status='queue' ORDER BY id ASC LIMIT 1", (c.from_user.id,)) as cur: 
+            first_req = await cur.fetchone()
+            
+        if first_req:
+            my_id = first_req[0]
+            # Считаем сколько заявок имеют ID меньше моего (стоят раньше)
+            async with db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id < ?", (my_id,)) as cur:
+                people_before = (await cur.fetchone())[0]
+        else:
+            people_before = 0
+
+        async with db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=? AND status='queue'", (c.from_user.id,)) as cur: my_queue_count = (await cur.fetchone())[0]
+
     kb = InlineKeyboardBuilder()
     kb.button(text="📝 Номера за сегодня", callback_data="my_nums")
     kb.button(text="🔙 Назад", callback_data="nav_main")
@@ -553,8 +569,8 @@ async def profile(c: CallbackQuery):
            f"📦 Всего номеров: {t}\n"
            f"✅ Выплачено: {d}\n\n"
            f"🕒 <b>В очереди:</b>\n"
-           f"Ваших номеров: {q_my}\n"
-           f"Всего в очереди: {q_total}")
+           f"Ваших номеров: {my_queue_count}\n"
+           f"Перед вами заявок: {people_before}")
     await c.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 @router.callback_query(F.data == "my_nums")
@@ -565,7 +581,7 @@ async def my_nums(c: CallbackQuery):
     txt = "📝 <b>Ваши номера (24ч):</b>\n\n"
     for r in rows:
         st_icon = "🟢" if r[1]=='active' else "✅" if r[1]=='finished' else "🟡"
-        txt += f"{st_icon} {r[0]} | {r[2]} | {get_local_time_str(r[3])}\n"
+        txt += f"{st_icon} {mask_phone(r[0], c.from_user.id)} | {r[2]} | {get_local_time_str(r[3])}\n"
     kb = InlineKeyboardBuilder(); kb.button(text="🔙", callback_data="menu_profile")
     if len(txt) > 4000: txt = txt[:4000]
     await c.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -578,7 +594,7 @@ async def adm_menu(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
     kb = InlineKeyboardBuilder()
     kb.button(text="📝 Тарифы (Изм.)", callback_data="adm_edittrf")
-    kb.button(text="📦 Очередь (ВСЯ)", callback_data="adm_queue_full") # ВСЯ ОЧЕРЕДЬ
+    kb.button(text="📦 Очередь (ВСЯ)", callback_data="adm_queue_full")
     kb.button(text="📄 Отчеты", callback_data="adm_reps")
     kb.button(text="📢 Рассылка", callback_data="adm_cast")
     kb.button(text="🔙 Меню", callback_data="nav_main")
@@ -689,8 +705,10 @@ async def proc_cast(m: types.Message, state: FSMContext):
             await m.copy_to(chat_id=u[0])
             cnt += 1
             await asyncio.sleep(0.05) # Задержка от спама
-        except Exception:
+        except TelegramForbiddenError:
             blocked += 1
+        except Exception as e:
+            logger.error(f"Cast err: {e}")
             
     await msg.edit_text(f"✅ <b>Рассылка завершена!</b>\n\n📩 Доставлено: {cnt}\n🚫 Бот заблокирован: {blocked}", parse_mode="HTML")
 
@@ -703,7 +721,7 @@ async def main():
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("🚀 STARTED v43.0 ULTIMATE")
+    logger.info("🚀 STARTED v44.0 FINAL")
     asyncio.create_task(queue_monitor(bot))
     await dp.start_polling(bot)
 
