@@ -1,4 +1,4 @@
-                                                                                                                                                                                                                                                                                                                                                                                     """
+"""
 WhatsApp Number Management Bot
 Fixed version with all features working
 """
