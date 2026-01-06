@@ -8,6 +8,7 @@ import io
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
+# Импорты aiogram
 try:
     import aiosqlite
     from aiogram import Bot, Dispatcher, Router, F, types
@@ -28,7 +29,7 @@ except ImportError:
 # КОНФИГУРАЦИЯ
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_СЮДА")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "12345678")) 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "12345678"))
 DB_NAME = "fast_team_v60.db"
 
 # Настройки AFK
@@ -57,7 +58,6 @@ async def init_db():
             is_approved INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0,
             reg_date TEXT DEFAULT CURRENT_TIMESTAMP)""")
         
-        # Добавил last_ping для AFK проверок
         await db.execute("""CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, 
             tariff_name TEXT, tariff_price TEXT, tariff_time TEXT, 
@@ -74,7 +74,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '24/7')")
         
         await db.commit()
-    logger.info("✅ DB Loaded v60.0")
+    logger.info("✅ DB Loaded v60.1")
 
 # ==========================================
 # УТИЛИТЫ
@@ -90,7 +90,6 @@ def mask_phone(phone, user_id):
     if user_id == ADMIN_ID: return phone
     try:
         if len(phone) < 9: return phone
-        # Оставляем начало и конец, центр скрываем
         return f"{phone[:5]}***{phone[-4:]}"
     except: return phone
 
@@ -99,7 +98,7 @@ def get_now(): return datetime.now(timezone.utc).isoformat()
 def format_time(iso_str):
     try:
         dt = datetime.fromisoformat(iso_str)
-        return (dt + timedelta(hours=3)).strftime("%d.%m %H:%M") # МСК
+        return (dt + timedelta(hours=3)).strftime("%d.%m %H:%M")
     except: return "-"
 
 def calc_duration(start_iso, end_iso):
@@ -146,43 +145,36 @@ def worker_active_kb(nid):
     return InlineKeyboardBuilder().button(text="📉 Слет", callback_data=f"w_drop_{nid}").as_markup()
 
 # ==========================================
-# AFK MONITOR (Фоновая задача)
+# AFK MONITOR
 # ==========================================
 async def afk_monitor(bot: Bot):
     while True:
         try:
-            await asyncio.sleep(60) # Проверка каждую минуту
+            await asyncio.sleep(60)
             now = datetime.now(timezone.utc)
             
             async with get_db() as db:
-                # 1. Ищем тех, кто долго стоит в очереди без проверки (AFK Check)
                 rows = await (await db.execute("SELECT id, user_id, phone, created_at, last_ping FROM numbers WHERE status='queue'")).fetchall()
                 
                 for r in rows:
-                    # Время создания или последней проверки
                     last_action_str = r['last_ping'] if r['last_ping'] else r['created_at']
-                    last_action = datetime.fromisoformat(last_action_str)
+                    # Обработка PENDING статуса
+                    if last_action_str.startswith("PENDING_"): continue
                     
+                    last_action = datetime.fromisoformat(last_action_str)
                     diff_min = (now - last_action).total_seconds() / 60
                     
-                    # Если прошло больше 8 минут - кидаем проверку
                     if diff_min >= AFK_CHECK_MINUTES:
                         kb = InlineKeyboardBuilder().button(text="👋 Я тут!", callback_data=f"afk_ok_{r['id']}").as_markup()
                         try:
                             await bot.send_message(r['user_id'], f"⚠️ <b>Проверка активности!</b>\n\nВы тут? Номер {mask_phone(r['phone'], r['user_id'])} будет удален через {AFK_TIMEOUT_MINUTES} мин.", reply_markup=kb, parse_mode="HTML")
-                            # Обновляем last_ping на "сейчас", но ставим метку (можно было бы статус поменять, но упростим)
-                            # Просто обновим пинг, если он не нажмет кнопку, в след раз удалим по логике ниже? 
-                            # Нет, нужна метка удаления.
-                            # Для простоты: Обновляем last_ping. Если юзер не нажмет кнопку, в следующий проход...
-                            # Реализуем через 'pending' статус
                             await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (f"PENDING_{get_now()}", r['id']))
                             await db.commit()
                         except: 
-                            # Если бот заблочен - удаляем сразу
                             await db.execute("UPDATE numbers SET status='deleted' WHERE id=?", (r['id'],))
                             await db.commit()
 
-                # 2. Удаление тех, кто не нажал кнопку (статус PENDING)
+                # Удаление PENDING
                 rows_pending = await (await db.execute("SELECT id, user_id, phone, last_ping FROM numbers WHERE status='queue' AND last_ping LIKE 'PENDING_%'")).fetchall()
                 for r in rows_pending:
                     ping_time_str = r['last_ping'].replace("PENDING_", "")
@@ -204,13 +196,12 @@ async def afk_confirm(c: CallbackQuery):
     async with get_db() as db:
         row = await (await db.execute("SELECT id FROM numbers WHERE id=?", (nid,))).fetchone()
         if row:
-            # Снимаем статус PENDING, обновляем время
             await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (get_now(), nid))
             await db.commit()
             await c.message.delete()
-            await c.answer("✅ Подтверждено! Вы в очереди.")
+            await c.answer("✅ Подтверждено!")
         else:
-            await c.answer("Номер уже удален или взят.", show_alert=True)
+            await c.answer("Номер удален.", show_alert=True)
             await c.message.delete()
 
 # ==========================================
@@ -288,25 +279,21 @@ async def proc_nums(m: Message, state: FSMContext):
 async def profile(c: CallbackQuery):
     uid = c.from_user.id
     async with get_db() as db:
-        # Всего в очереди (глобально)
         q_all = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue'")).fetchone())[0]
-        # Мои в очереди
         q_mine = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=? AND status='queue'", (uid,))).fetchone())[0]
-        # Позиция первого моего номера
         my_first = await (await db.execute("SELECT id FROM numbers WHERE user_id=? AND status='queue' ORDER BY id ASC LIMIT 1", (uid,))).fetchone()
         pos = 0
         if my_first:
             pos = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id < ?", (my_first[0],))).fetchone())[0] + 1
         
-        # Всего номеров
         total = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (uid,))).fetchone())[0]
     
     txt = (f"👤 <b>Профиль</b>\n"
            f"📦 Всего сдано: {total}\n\n"
            f"🕒 <b>ОЧЕРЕДЬ</b>\n"
            f"🌍 Всего в очереди: {q_all}\n"
-           f"👤 Ваших номеров в ожидании: {q_mine}\n"
-           f"🔢 Ваша позиция (ближайшая): {pos if q_mine > 0 else '-'}")
+           f"👤 Ваших номеров: {q_mine}\n"
+           f"🔢 Ваша позиция: {pos if q_mine > 0 else '-'}")
     
     kb = InlineKeyboardBuilder()
     kb.button(text="📝 Мои номера (Удалить)", callback_data="my_nums")
@@ -323,12 +310,9 @@ async def my_nums(c: CallbackQuery):
     if not rows: return await c.message.edit_text("📭 У вас нет активных номеров.", reply_markup=InlineKeyboardBuilder().button(text="🔙", callback_data="profile").as_markup())
     
     kb = InlineKeyboardBuilder()
-    txt = "📝 <b>Ваши активные номера:</b>\n"
     for r in rows:
         st_icon = "⏳" if r['status']=='queue' else "🔥"
-        # Кнопка удаления для очереди
-        btn_text = f"❌ {mask_phone(r['phone'], uid)}"
-        kb.button(text=btn_text, callback_data=f"del_{r['id']}")
+        kb.button(text=f"❌ {st_icon} {mask_phone(r['phone'], uid)}", callback_data=f"del_{r['id']}")
     
     kb.button(text="🔙 Назад", callback_data="profile")
     kb.adjust(1)
@@ -342,10 +326,10 @@ async def del_num_user(c: CallbackQuery):
         if row and row['status'] == 'queue':
             await db.execute("DELETE FROM numbers WHERE id=?", (nid,))
             await db.commit()
-            await c.answer("✅ Номер удален из очереди")
-            await my_nums(c) # Обновить список
+            await c.answer("✅ Номер удален")
+            await my_nums(c)
         else:
-            await c.answer("❌ Нельзя удалить (уже в работе или не ваш)", show_alert=True)
+            await c.answer("❌ Нельзя удалить (уже в работе)", show_alert=True)
 
 # ==========================================
 # ВОРКЕР (ЛОГИКА)
@@ -357,18 +341,16 @@ async def worker_get_num(m: Message, bot: Bot):
         conf = await (await db.execute("SELECT value FROM config WHERE key=?", (f"topic_{cid}_{tid}",))).fetchone()
         if not conf: return await m.reply("❌ Топик не настроен.")
         
-        # Берем номер
         row = await (await db.execute("SELECT * FROM numbers WHERE status='queue' AND tariff_name=? ORDER BY id ASC LIMIT 1", (conf['value'],))).fetchone()
         if not row: return await m.reply("📭 Очередь пуста.")
         
-        # Обновляем статус
         await db.execute("UPDATE numbers SET status='work', worker_id=?, start_time=? WHERE id=?", (m.from_user.id, get_now(), row['id']))
         await db.commit()
         
-        # Уведомляем 3-го в очереди
+        # Уведомляем 3-го
         next_in_line = await (await db.execute("SELECT user_id FROM numbers WHERE status='queue' AND tariff_name=? ORDER BY id ASC LIMIT 1 OFFSET 2", (conf['value'],))).fetchone()
         if next_in_line:
-            try: await bot.send_message(next_in_line['user_id'], "🔔 <b>Приготовьтесь!</b>\nСкоро ваша очередь (вы 3-й).")
+            try: await bot.send_message(next_in_line['user_id'], "🔔 <b>Приготовьтесь!</b>\nСкоро ваша очередь (вы 3-й).", parse_mode="HTML")
             except: pass
 
     await m.answer(f"🚀 <b>Вы взяли номер</b>\n📱 <code>{row['phone']}</code>\nОжидайте код.", 
@@ -391,16 +373,15 @@ async def worker_code_req(m: Message, command: CommandObject, bot: Bot):
                                f"🔔 <b>Офис запросил номер</b>\n📱 {mask_phone(ph, row['user_id'])}\n👇 <b>Ответьте ниже сообщением чтобы дать код.</b>", 
                                reply_markup=types.ForceReply(selective=True), parse_mode="HTML")
         await m.reply("✅ Запрос отправлен юзеру.")
-    except: await m.reply("❌ Ошибка отправки (юзер блок?).")
+    except: await m.reply("❌ Ошибка отправки.")
 
 # --- ОТВЕТ ЮЗЕРА (ПЕРЕСЫЛКА) ---
 @router.message(F.reply_to_message)
 async def user_reply_handler(m: Message, bot: Bot):
-    # Проверка: сообщение юзера, есть реплай, и этот реплай от бота
     if m.from_user.id == ADMIN_ID: return 
+    # Проверка, что реплай на сообщение бота
     if m.reply_to_message.from_user.id == bot.id:
         async with get_db() as db:
-            # Ищем активный номер этого юзера
             row = await (await db.execute("SELECT * FROM numbers WHERE user_id=? AND status IN ('work','active')", (m.from_user.id,))).fetchone()
         
         if row:
@@ -408,10 +389,9 @@ async def user_reply_handler(m: Message, bot: Bot):
             try:
                 await bot.send_message(row['worker_id'], f"📩 <b>ОТВЕТ ЮЗЕРА</b>\n📱 {row['phone']}\n💬 <code>{content}</code>", parse_mode="HTML")
                 await m.answer("✅ Отправлено офису.")
-            except: 
-                await m.answer("❌ Ошибка доставки офису.")
+            except: pass
 
-# --- ФОТО ОТ ВОРКЕРА (/sms) ---
+# --- ФОТО ОТ ВОРКЕРА ---
 @router.message(F.photo)
 async def worker_photo_sms(m: Message, bot: Bot):
     if not m.caption or "/sms" not in m.caption.lower(): return
@@ -453,11 +433,10 @@ async def w_skip(c: CallbackQuery, bot: Bot):
     async with get_db() as db:
         row = await (await db.execute("SELECT * FROM numbers WHERE id=?", (nid,))).fetchone()
         if not row or row['worker_id'] != c.from_user.id: return await c.answer("❌ Не твой номер!", show_alert=True)
-        # Возврат в очередь
         await db.execute("UPDATE numbers SET status='queue', worker_id=0 WHERE id=?", (nid,))
         await db.commit()
     
-    await c.message.edit_text("⏭ <b>Пропуск</b> (номер вернулся в очередь)", parse_mode="HTML")
+    await c.message.edit_text("⏭ <b>Пропуск</b> (вернулся в очередь)", parse_mode="HTML")
     try: await bot.send_message(row['user_id'], "⚠️ Офис пропустил ваш номер.", parse_mode="HTML")
     except: pass
 
@@ -502,7 +481,7 @@ async def adm_main(c: CallbackQuery):
 @router.callback_query(F.data == "adm_reports")
 async def adm_reports(c: CallbackQuery):
     kb = InlineKeyboardBuilder()
-    periods = [1, 3, 5, 9, 12, 15, 24, 48, 72, 168] # Часы (168 = неделя)
+    periods = [1, 3, 5, 9, 12, 15, 24, 48, 72, 168]
     for h in periods:
         lbl = f"{h}ч" if h < 25 else f"{h//24}д"
         kb.button(text=lbl, callback_data=f"rep_{h}")
@@ -527,7 +506,7 @@ async def adm_get_rep(c: CallbackQuery):
     await c.message.answer_document(BufferedInputFile(out.getvalue().encode(), filename=f"report_{hours}h.csv"), caption=f"📊 Отчет за {hours}ч: {len(rows)} строк")
     await c.answer()
 
-# --- ТАРИФЫ (ВРЕМЯ -> ПРАЙС) ---
+# --- ТАРИФЫ ---
 @router.callback_query(F.data == "adm_tariffs")
 async def adm_tariffs(c: CallbackQuery):
     async with get_db() as db:
@@ -558,7 +537,7 @@ async def ed_t3(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("✅ Тариф сохранен!", reply_markup=main_kb(ADMIN_ID))
 
-# --- РАССЫЛКА И ОЧЕРЕДЬ ---
+# --- РАССЫЛКА ---
 @router.callback_query(F.data == "adm_cast")
 async def adm_cast(c: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.waiting_broadcast)
@@ -580,6 +559,7 @@ async def proc_cast(m: Message, state: FSMContext):
         except: pass
     await msg.edit_text(f"✅ Ушло {cnt} юзерам.")
 
+# --- ОЧЕРЕДЬ (ТЕКСТ) ---
 @router.callback_query(F.data == "adm_queue")
 async def adm_queue_list(c: CallbackQuery):
     async with get_db() as db:
@@ -624,6 +604,20 @@ async def send_reply(m: Message, state: FSMContext, bot: Bot):
 async def back_main(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.edit_text("Меню", reply_markup=main_kb(c.from_user.id))
+    
+@router.callback_query(F.data == "guide")
+async def show_guide(c: CallbackQuery):
+    txt = ("📲 <b>Что делает бот</b>\n"
+           "Бот принимает номера WhatsApp / MAX, ставит их в очередь и выплачивает средства после успешной проверки.\n\n"
+           "📦 <b>Требования к номерам</b>\n"
+           "✔️ Активный и чистый номер\n"
+           "✔️ Доступ к SMS\n"
+           "❌ Виртуальные, заблокированные и использованные номера не принимаются\n\n"
+           "⏳ <b>Холд и выплаты</b>\n"
+           "Холд — время проверки номера\n"
+           "💰 Выплата производится после успешного завершения холда\n\n"
+           "⚠️ <i>Отправляя номер, вы подтверждаете, что ознакомились с правилами</i>")
+    await c.message.edit_text(txt, reply_markup=main_kb(c.from_user.id), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("acc_"))
 async def acc_dec(c: CallbackQuery, bot: Bot):
@@ -639,7 +633,7 @@ async def acc_dec(c: CallbackQuery, bot: Bot):
             await c.message.edit_text(f"🚫 {uid} забанен")
         await db.commit()
 
-# --- СИСТЕМНЫЕ КОМАНДЫ ДЛЯ ВОРКЕРА ---
+# --- СИСТЕМНЫЕ КОМАНДЫ ---
 @router.message(Command("startwork"))
 async def sys_start(m: Message):
     if m.from_user.id != ADMIN_ID: return
@@ -689,10 +683,9 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Запуск фонового AFK монитора
     asyncio.create_task(afk_monitor(bot))
     
-    logger.info("🚀 BOT STARTED v60.0")
+    logger.info("🚀 BOT STARTED v60.1")
     try: await dp.start_polling(bot)
     finally: await bot.session.close()
 
