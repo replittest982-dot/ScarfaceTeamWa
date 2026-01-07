@@ -75,11 +75,13 @@ async def init_db():
             wait_code_start TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         
-        # Тарифы
+        # Тарифы - ОБНОВЛЕННАЯ СТРУКТУРА
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (
-            name TEXT PRIMARY KEY, price TEXT, work_time TEXT, hold_time TEXT DEFAULT '20 мин')""")
+            name TEXT PRIMARY KEY, 
+            price TEXT, 
+            hold_time TEXT DEFAULT '20 мин')""")
         
-        # Группы (Офисы) - НОВАЯ ТАБЛИЦА
+        # Группы (Офисы)
         await db.execute("""CREATE TABLE IF NOT EXISTS groups (
             group_num INTEGER PRIMARY KEY,
             chat_id INTEGER,
@@ -90,15 +92,11 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         
         # Дефолтные тарифы
-        await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('WhatsApp', '50₽', '10:00-22:00 МСК', '20 мин')")
-        await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '24/7', '1 час')")
-        
-        # Миграция колонок (на случай старой базы)
-        try: await db.execute("ALTER TABLE tariffs ADD COLUMN hold_time TEXT DEFAULT '20 мин'")
-        except: pass 
+        await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('WhatsApp', '50₽', '20 мин')")
+        await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '1 час')")
         
         await db.commit()
-    logger.info("✅ DB Loaded v84.0 (Groups System)")
+    logger.info("✅ DB Loaded v84.1 (FIXED)")
 
 # ==========================================
 # 3. УТИЛИТЫ
@@ -143,7 +141,6 @@ class UserState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_broadcast = State()
-    edit_time = State()
     edit_hold = State()
     edit_price = State()
     support_reply = State()
@@ -176,8 +173,6 @@ def worker_active_kb(nid):
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
-    # ОТЛАДКА ДЛЯ ПОДДЕРЖКИ
-    print(f"🚨 DEBUG START: ADMIN_ID={ADMIN_ID}, user={m.from_user.id}")
     await state.clear()
     uid = m.from_user.id
     async with get_db() as db:
@@ -284,7 +279,6 @@ async def delete_num(c: CallbackQuery):
 async def sel_tariff(c: CallbackQuery):
     async with get_db() as db:
         rows = await (await db.execute("SELECT * FROM tariffs")).fetchall()
-        print(f"DEBUG TARIFFS: {len(rows)} тарифов")
 
     if not rows:
         await c.message.edit_text("❌ Тарифы не настроены!", reply_markup=main_kb(c.from_user.id), parse_mode="HTML")
@@ -304,14 +298,13 @@ async def pick_t(c: CallbackQuery, state: FSMContext):
     async with get_db() as db:
         res = await (await db.execute("SELECT * FROM tariffs WHERE name=?", (t_name,))).fetchone()
     
-    await state.update_data(tariff=t_name, price=res['price'], time=res['work_time'])
+    await state.update_data(tariff=t_name, price=res['price'])
     
     kb = InlineKeyboardBuilder().button(text="🔙 Отмена", callback_data="back_main")
     await c.message.edit_text(
         f"💎 Тариф: <b>{t_name}</b>\n"
         f"💰 Прайс: <b>{res['price']}</b>\n"
-        f"⏳ Холд: <b>{res['hold_time']}</b>\n"
-        f"⏰ Время работы: <b>{res['work_time']}</b>\n{SEP}\n"
+        f"⏳ Холд: <b>{res['hold_time']}</b>\n{SEP}\n"
         f"📱 <b>Отправьте номера списком или по одному (+7...):</b>", 
         reply_markup=kb.as_markup(), parse_mode="HTML"
     )
@@ -332,8 +325,8 @@ async def proc_nums(m: Message, state: FSMContext):
     async with get_db() as db:
         for ph in valid:
             await db.execute(
-                "INSERT INTO numbers (user_id, phone, tariff_name, tariff_price, tariff_time, last_ping) VALUES (?, ?, ?, ?, ?, ?)",
-                (m.from_user.id, ph, data['tariff'], data['price'], data['time'], get_now())
+                "INSERT INTO numbers (user_id, phone, tariff_name, tariff_price, last_ping) VALUES (?, ?, ?, ?, ?)",
+                (m.from_user.id, ph, data['tariff'], data['price'], get_now())
             )
         await db.commit()
     
@@ -390,20 +383,17 @@ async def sys_bind(c: CallbackQuery):
 async def sys_stop(m: Message, bot: Bot):
     if m.from_user.id != ADMIN_ID: return
     
-    # ПРОВЕРЯЕМ: ЭТО ГРУППА ИЛИ ПРОСТО ТОПИК?
     chat_id = m.chat.id
     
     async with get_db() as db:
         group = await (await db.execute("SELECT * FROM groups WHERE chat_id=?", (chat_id,))).fetchone()
         
         if group:
-            # ЭТО ГРУППА -> ОСТАНАВЛИВАЕМ НОМЕРА
             group_num = group['group_num']
             title = group['title']
             stop_time_utc = get_now()
             stop_time_msk = format_time(stop_time_utc)
             
-            # Находим активные номера ЭТОГО чата
             nums = await (await db.execute("""
                 SELECT id, user_id, phone, start_time FROM numbers 
                 WHERE status IN ('work', 'active') AND worker_chat_id=?
@@ -431,13 +421,11 @@ async def sys_stop(m: Message, bot: Bot):
             await m.answer(f"🛑 <b>СТОП ВОРК!</b>\n{SEP}\n🏢 Офис: {title}\n📦 Остановили номеров: {stopped_count}", parse_mode="HTML")
             
         else:
-            # ЭТО НЕ ГРУППА -> ПРОСТО ОТВЯЗЫВАЕМ ТОПИК
             cid, tid = m.chat.id, (m.message_thread_id if m.is_topic_message else 0)
             await db.execute("DELETE FROM config WHERE key=?", (f"topic_{cid}_{tid}",))
             await db.commit()
             await m.reply("🛑 <b>Топик отключен (конфиг удален).</b>", parse_mode="HTML")
 
-# --- ВЗЯТИЕ НОМЕРА ---
 @router.message(Command("num"))
 async def worker_get_num(m: Message, bot: Bot):
     cid = m.chat.id
@@ -457,7 +445,6 @@ async def worker_get_num(m: Message, bot: Bot):
     try: await bot.send_message(row['user_id'], f"⚡ <b>Ваш номер {mask_phone(row['phone'], row['user_id'])} взят в работу!</b>\n{SEP}\nОжидайте QR или SMS код.", parse_mode="HTML")
     except: pass
 
-# --- ЗАПРОС КОДА ---
 @router.message(Command("code"))
 async def worker_code_req(m: Message, command: CommandObject, bot: Bot):
     if not command.args: return await m.reply("⚠️ Пример: <code>/code +7999...</code>", parse_mode="HTML")
@@ -475,7 +462,6 @@ async def worker_code_req(m: Message, command: CommandObject, bot: Bot):
         await m.reply(f"✅ <b>Запрос отправлен.</b>", parse_mode="HTML")
     except: await m.reply("❌ Ошибка доставки.")
 
-# --- SMS ФОТО ---
 @router.message(F.photo & F.caption)
 async def worker_photo_sms(m: Message, bot: Bot):
     if "/sms" not in m.caption.lower(): return
@@ -496,7 +482,10 @@ async def worker_photo_sms(m: Message, bot: Bot):
 async def user_any_msg(m: Message, bot: Bot, state: FSMContext):
     if m.text and m.text.startswith('/'): return
     if m.from_user.id == ADMIN_ID: return
-    if await state.get_state(): return 
+    
+    # ПРОВЕРЯЕМ СОСТОЯНИЕ FSM
+    current_state = await state.get_state()
+    if current_state: return  # Если юзер в состоянии - не обрабатываем
     
     async with get_db() as db:
         row = await (await db.execute("SELECT * FROM numbers WHERE user_id=? AND status IN ('work','active')", (m.from_user.id,))).fetchone()
@@ -515,7 +504,6 @@ async def user_any_msg(m: Message, bot: Bot, state: FSMContext):
             await m.answer("✅ <b>Отправлено.</b>", parse_mode="HTML")
         except: await m.answer("❌ Ошибка отправки.")
 
-# --- КНОПКИ ВОРКЕРА ---
 @router.callback_query(F.data.startswith("w_act_"))
 async def w_act(c: CallbackQuery, bot: Bot):
     nid = c.data.split("_")[2]
@@ -557,7 +545,7 @@ async def w_finish(c: CallbackQuery, bot: Bot):
     except: pass
 
 # ==========================================
-# 7. АДМИНКА (УПРАВЛЕНИЕ ГРУППАМИ)
+# 7. АДМИНКА
 # ==========================================
 @router.callback_query(F.data == "admin_main")
 async def adm_main(c: CallbackQuery):
@@ -566,7 +554,7 @@ async def adm_main(c: CallbackQuery):
     kb.button(text="📝 Тарифы", callback_data="adm_tariffs")
     kb.button(text="📄 Отчеты", callback_data="adm_reports")
     kb.button(text="📢 Рассылка", callback_data="adm_cast")
-    kb.button(text="🏢 Группы", callback_data="manage_groups")  # МЕНЮ ГРУПП
+    kb.button(text="🏢 Группы", callback_data="manage_groups")
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
     await c.message.edit_text(f"⚡ <b>Админ панель</b>\n{SEP}", reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -575,16 +563,13 @@ async def adm_main(c: CallbackQuery):
 async def manage_groups(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
     
-    # ПОДГРУЖАЕМ НАЗВАНИЯ ГРУПП
     async with get_db() as db:
         groups = await (await db.execute("SELECT * FROM groups ORDER BY group_num")).fetchall()
     
     kb = InlineKeyboardBuilder()
     
-    # Кнопки стопа с реальными именами
     for i in range(1, 4):
         g_name = "Нет данных"
-        # Ищем в базе
         for g in groups:
             if g['group_num'] == i:
                 g_name = g['title']
@@ -606,7 +591,6 @@ async def stop_group(c: CallbackQuery, bot: Bot):
     stop_time_msk = format_time(stop_time_utc)
     
     async with get_db() as db:
-        # 1. Получаем chat_id и имя группы
         group = await (await db.execute("SELECT * FROM groups WHERE group_num=?", (group_num,))).fetchone()
         
         if not group:
@@ -615,7 +599,6 @@ async def stop_group(c: CallbackQuery, bot: Bot):
         chat_id = group['chat_id']
         title = group['title']
         
-        # 2. Находим номера, где worker_chat_id == chat_id группы
         nums = await (await db.execute("""
             SELECT id, user_id, phone, start_time 
             FROM numbers 
@@ -668,7 +651,7 @@ async def groups_status(c: CallbackQuery):
     kb = InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="manage_groups").adjust(1)
     await c.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
 
-# --- ИЗМЕНЕНИЕ ТАРИФОВ ---
+# --- ТАРИФЫ (ИСПРАВЛЕНО) ---
 @router.callback_query(F.data == "adm_tariffs")
 async def adm_tariffs(c: CallbackQuery):
     async with get_db() as db:
@@ -683,31 +666,25 @@ async def adm_tariffs(c: CallbackQuery):
 async def ed_t1(c: CallbackQuery, state: FSMContext):
     target = c.data.split("_")[1]
     await state.update_data(target=target)
-    await state.set_state(AdminState.edit_time)
-    await c.message.edit_text(f"1️⃣ Введите <b>ВРЕМЯ РАБОТЫ</b> для {target}:\n(Пример: 10:00-22:00)", parse_mode="HTML")
-
-@router.message(AdminState.edit_time)
-async def ed_t2(m: Message, state: FSMContext):
-    await state.update_data(time=m.text)
-    await state.set_state(AdminState.edit_hold)
-    await m.answer(f"2️⃣ Введите <b>ВРЕМЯ ХОЛДА</b>:\n(Пример: 20 мин, 1 час)", parse_mode="HTML")
-
-@router.message(AdminState.edit_hold)
-async def ed_t3(m: Message, state: FSMContext):
-    await state.update_data(hold=m.text)
     await state.set_state(AdminState.edit_price)
-    await m.answer("3️⃣ Введите <b>ЦЕНУ</b>:\n(Пример: 50₽, 10$)", parse_mode="HTML")
+    await c.message.edit_text(f"1️⃣ Введите <b>ЦЕНУ</b> для {target}:\n(Пример: 50₽, 10$, 2$)", parse_mode="HTML")
 
 @router.message(AdminState.edit_price)
+async def ed_t2(m: Message, state: FSMContext):
+    await state.update_data(price=m.text)
+    await state.set_state(AdminState.edit_hold)
+    await m.answer(f"2️⃣ Введите <b>ВРЕМЯ ХОЛДА</b>:\n(Пример: 20 мин, 30мин, 1 час)", parse_mode="HTML")
+
+@router.message(AdminState.edit_hold)
 async def ed_t_fin(m: Message, state: FSMContext):
     d = await state.get_data()
     async with get_db() as db:
-        await db.execute("UPDATE tariffs SET price=?, work_time=?, hold_time=? WHERE name=?", (m.text, d['time'], d['hold'], d['target']))
+        await db.execute("UPDATE tariffs SET price=?, hold_time=? WHERE name=?", (d['price'], m.text, d['target']))
         await db.commit()
     await state.clear()
-    await m.answer(f"✅ <b>Тариф обновлен!</b>\n{SEP}\n⏰ {d['time']}\n⏳ {d['hold']}\n💰 {m.text}", parse_mode="HTML")
+    await m.answer(f"✅ <b>Тариф обновлен!</b>\n{SEP}\n💰 {d['price']}\n⏳ {m.text}", parse_mode="HTML")
 
-# --- ОТЧЕТЫ (С ИМЕНАМИ ГРУПП) ---
+# --- ОТЧЕТЫ ---
 @router.callback_query(F.data == "adm_reports")
 async def adm_reports(c: CallbackQuery):
     kb = InlineKeyboardBuilder()
@@ -722,7 +699,6 @@ async def adm_get_rep(c: CallbackQuery):
     cut_time = (datetime.now(timezone.utc) - timedelta(hours=h)).isoformat()
     
     async with get_db() as db:
-        # JOIN для получения имени группы
         rows = await (await db.execute("""
             SELECT n.*, g.title as group_name 
             FROM numbers n 
@@ -750,7 +726,7 @@ async def adm_get_rep(c: CallbackQuery):
     file_data = BufferedInputFile(out.getvalue().encode(), filename=f"report_{h}h.csv")
     await c.message.answer_document(file_data, caption=f"📊 Отчет за {h}ч")
 
-# --- ПОДДЕРЖКА ---
+# --- ПОДДЕРЖКА (ИСПРАВЛЕНО) ---
 @router.callback_query(F.data == "ask_supp")
 async def ask_supp(c: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder().button(text="🔙 Отмена", callback_data="back_main")
@@ -760,12 +736,14 @@ async def ask_supp(c: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_support)
 async def send_supp(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    print(f"🚨 DEBUG SUPPORT: user={m.from_user.id}, ADMIN={ADMIN_ID}, msg='{m.text}'")
     
     kb = InlineKeyboardBuilder().button(text="💬 Ответить", callback_data=f"reply_{m.from_user.id}")
     try:
-        await bot.send_message(ADMIN_ID, f"🆘 <b>Вопрос от {m.from_user.id}</b> (@{m.from_user.username})\n{SEP}\n{m.text}", reply_markup=kb.as_markup(), parse_mode="HTML")
-        await m.answer(f"✅ <b>Отправлено.</b>\nАдминистратор ответит вам.", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
+        await bot.send_message(ADMIN_ID, 
+            f"🆘 <b>Вопрос от {m.from_user.id}</b> (@{m.from_user.username})\n{SEP}\n{m.text}", 
+            reply_markup=kb.as_markup(), parse_mode="HTML")
+        await m.answer(f"✅ <b>Отправлено.</b>\nАдминистратор ответит вам.", 
+                       reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
     except Exception as e:
         logger.error(f"Supp Error: {e}")
         await m.answer("❌ Ошибка отправки.")
@@ -787,7 +765,8 @@ async def send_reply(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 @router.callback_query(F.data == "back_main")
-async def back_to_main(c: CallbackQuery):
+async def back_to_main(c: CallbackQuery, state: FSMContext):
+    await state.clear()  # ЧИСТИМ СОСТОЯНИЕ
     await c.message.edit_text(f"👋 <b>Главное меню</b>\n{SEP}", reply_markup=main_kb(c.from_user.id), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("acc_"))
@@ -806,15 +785,16 @@ async def acc_dec(c: CallbackQuery, bot: Bot):
             await db.commit()
             await c.message.edit_text(f"🚫 Юзер {uid} забанен.")
 
-# --- РАССЫЛКА ---
+# --- РАССЫЛКА (ИСПРАВЛЕНО) ---
 @router.callback_query(F.data == "adm_cast")
 async def adm_cast(c: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.waiting_broadcast)
     await c.message.edit_text("📢 <b>Пришлите пост для рассылки:</b>", parse_mode="HTML")
 
 @router.message(AdminState.waiting_broadcast)
-async def proc_cast(m: Message, state: FSMContext):
+async def proc_cast(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
+    
     msg = await m.answer("⏳ <b>Рассылка запущена...</b>", parse_mode="HTML")
     
     async with get_db() as db:
@@ -900,7 +880,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(global_monitor(bot))
-    logger.info("🚀 BOT v84.0 STARTED (GROUPS + FIXES)")
+    logger.info("🚀 BOT v84.1 STARTED (FIXED: SUPPORT + BROADCAST + TARIFFS)")
     try: await dp.start_polling(bot)
     finally: await bot.session.close()
 
