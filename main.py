@@ -28,9 +28,10 @@ except ImportError:
 # ==========================================
 # 1. КОНФИГУРАЦИЯ
 # ==========================================
+# Вставь свой токен и ID админа
 TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_СЮДА") 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "12345678")) 
-DB_NAME = "bot_v81_design.db" 
+DB_NAME = "bot_v82_final.db" 
 
 # Таймеры (в минутах)
 AFK_CHECK_MINUTES = 8      # Через сколько спрашивать "Ты тут?"
@@ -82,7 +83,7 @@ async def init_db():
         # Миграция для старых баз (добавление колонки hold_time)
         try:
             await db.execute("ALTER TABLE tariffs ADD COLUMN hold_time TEXT DEFAULT '20 мин'")
-        except: pass # Колонка уже есть
+        except: pass 
         
         # Конфиг топиков
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
@@ -92,7 +93,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '24/7', '1 час')")
         
         await db.commit()
-    logger.info("✅ DB Loaded v81.0 (Design & Fixes)")
+    logger.info("✅ DB Loaded v82.0 (Full Fixes)")
 
 # ==========================================
 # 3. УТИЛИТЫ
@@ -138,7 +139,7 @@ class UserState(StatesGroup):
 class AdminState(StatesGroup):
     waiting_broadcast = State()
     edit_time = State()
-    edit_hold = State()  # Новое состояние для Холда
+    edit_hold = State()
     edit_price = State()
     support_reply = State()
 
@@ -274,14 +275,19 @@ async def delete_num(c: CallbackQuery):
         else:
             await c.answer("❌ Номер уже в работе!", show_alert=True)
 
-# --- СДАЧА НОМЕРА ---
+# --- СДАЧА НОМЕРА (FIXED) ---
 @router.callback_query(F.data == "sel_tariff")
 async def sel_tariff(c: CallbackQuery):
     async with get_db() as db:
         rows = await (await db.execute("SELECT * FROM tariffs")).fetchall()
+        print(f"DEBUG TARIFFS: найдено {len(rows)} тарифов")  # ЛОГ
+
+    if not rows:
+        await c.message.edit_text("❌ <b>Тарифы не настроены!</b>\nОбратитесь к администратору.", reply_markup=main_kb(c.from_user.id), parse_mode="HTML")
+        return
+
     kb = InlineKeyboardBuilder()
     for r in rows: 
-        # Красивое отображение с холдом
         kb.button(text=f"{r['name']} | {r['price']} (Hold: {r.get('hold_time', '-')})", callback_data=f"pick_{r['name']}")
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
@@ -293,7 +299,6 @@ async def pick_t(c: CallbackQuery, state: FSMContext):
     async with get_db() as db:
         res = await (await db.execute("SELECT * FROM tariffs WHERE name=?", (t_name,))).fetchone()
     
-    # Сохраняем все данные тарифа
     await state.update_data(tariff=t_name, price=res['price'], time=res['work_time'])
     
     kb = InlineKeyboardBuilder().button(text="🔙 Отмена", callback_data="back_main")
@@ -678,7 +683,7 @@ async def ed_t_fin(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(f"✅ <b>Тариф {d['target']} обновлен!</b>\n{SEP}\n⏰ {d['time']}\n⏳ {d['hold']}\n💰 {m.text}", parse_mode="HTML")
 
-# --- РАССЫЛКА ---
+# --- РАССЫЛКА (FIXED) ---
 @router.callback_query(F.data == "adm_cast")
 async def adm_cast(c: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.waiting_broadcast)
@@ -687,19 +692,31 @@ async def adm_cast(c: CallbackQuery, state: FSMContext):
 @router.message(AdminState.waiting_broadcast)
 async def proc_cast(m: Message, state: FSMContext):
     await state.clear()
-    msg = await m.answer("⏳ Рассылка запущена...")
+    msg = await m.answer("⏳ <b>Рассылка запущена...</b>")
+    
     async with get_db() as db:
         users = await (await db.execute("SELECT user_id FROM users")).fetchall()
     
-    cnt = 0
+    success = 0
+    fail = 0
+    
     for u in users:
         try:
             await m.copy_to(u['user_id'])
-            cnt += 1
+            success += 1
             await asyncio.sleep(0.05)
-        except: pass
+        except TelegramForbiddenError:
+            fail += 1
+        except Exception:
+            fail += 1
             
-    await msg.edit_text(f"📢 <b>Рассылка завершена.</b>\n✅ Доставлено: {cnt}", parse_mode="HTML")
+    await msg.edit_text(
+        f"📢 <b>Рассылка завершена!</b>\n{SEP}\n"
+        f"✅ Доставлено: <b>{success}</b>\n"
+        f"❌ Ошибок: <b>{fail}</b>\n"
+        f"📊 Всего юзеров: <b>{len(users)}</b>",
+        parse_mode="HTML"
+    )
 
 # ==========================================
 # 8. ИСПРАВЛЕННАЯ ПОДДЕРЖКА
@@ -713,6 +730,8 @@ async def ask_supp(c: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_support)
 async def send_supp(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
+    print(f"DEBUG SUPPORT: user={m.from_user.id}, ADMIN={ADMIN_ID}, text='{m.text[:50]}...'")
+    
     kb = InlineKeyboardBuilder().button(text="💬 Ответить", callback_data=f"reply_{m.from_user.id}")
     try:
         await bot.send_message(
@@ -721,8 +740,10 @@ async def send_supp(m: Message, state: FSMContext, bot: Bot):
             reply_markup=kb.as_markup(), parse_mode="HTML"
         )
         await m.answer(f"✅ <b>Отправлено.</b>\nАдминистратор ответит вам в ближайшее время.", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
+        print(f"SUCCESS: вопрос от {m.from_user.id} дошёл до админа {ADMIN_ID}")
     except Exception as e:
         logger.error(f"Supp Error: {e}")
+        print(f"ERROR: не дошло до админа {ADMIN_ID} от юзера {m.from_user.id}: {e}")
         await m.answer("❌ Ошибка отправки.")
 
 @router.callback_query(F.data.startswith("reply_"))
@@ -761,6 +782,15 @@ async def acc_dec(c: CallbackQuery, bot: Bot):
             await db.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
             await db.commit()
             await c.message.edit_text(f"🚫 Юзер {uid} забанен.")
+
+# --- КНОПКА НАЗАД (FIX) ---
+@router.callback_query(F.data == "back_main")
+async def back_to_main(c: CallbackQuery):
+    await c.message.edit_text(
+        f"👋 <b>Главное меню</b>\n{SEP}",
+        reply_markup=main_kb(c.from_user.id),
+        parse_mode="HTML"
+    )
 
 # ==========================================
 # 9. МОНИТОРИНГ (AFK FIX + DELETE)
@@ -843,7 +873,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(global_monitor(bot))
-    logger.info("🚀 BOT v81.0 STARTED (Design & Fixes)")
+    logger.info("🚀 BOT v82.0 STARTED (Full Fixes & Design)")
     try: await dp.start_polling(bot)
     finally: await bot.session.close()
 
