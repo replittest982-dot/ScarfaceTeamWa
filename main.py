@@ -1,6 +1,3 @@
-# ============================================
-# ЧАСТЬ 1 из 3 - ИМПОРТЫ И БАЗА ДАННЫХ
-# ============================================
 import asyncio
 import logging
 import sys
@@ -18,26 +15,32 @@ try:
     from aiogram.fsm.context import FSMContext
     from aiogram.fsm.state import State, StatesGroup
     from aiogram.fsm.storage.memory import MemoryStorage
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, ReactionTypeEmoji, BufferedInputFile
+    from aiogram.types import (
+        InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, 
+        Message, ReactionTypeEmoji, BufferedInputFile
+    )
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     from aiogram.exceptions import TelegramForbiddenError
 except ImportError:
     sys.exit("❌ pip install aiogram aiosqlite")
 
-TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-DB_NAME = "bot_final.db"
+# --- КОНФИГУРАЦИЯ ---
+TOKEN = os.getenv("BOT_TOKEN") # Убедись, что токен в .env
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # ID админа
+DB_NAME = "fast_team_v19.db"
 
+# ГЛОБАЛЬНЫЕ КОНСТАНТЫ (Исправление NameError)
 AFK_CHECK_MINUTES = 15
 AFK_KICK_MINUTES = 10
 CODE_WAIT_MINUTES = 5
-
 SEP = "━━━━━━━━━━━━━━━━━━━━"
 
+# ЛОГИРОВАНИЕ
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 router = Router()
 
+# --- БАЗА ДАННЫХ ---
 @asynccontextmanager
 async def get_db():
     conn = await aiosqlite.connect(DB_NAME, timeout=30)
@@ -56,11 +59,14 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (name TEXT PRIMARY KEY,price TEXT,work_time TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS groups (group_num INTEGER PRIMARY KEY,chat_id INTEGER,title TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY,value TEXT)""")
+        
+        # Дефолтные тарифы
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('WhatsApp','50₽','10:00-22:00 МСК')")
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('MAX','10$','24/7')")
         await db.commit()
     logger.info("✅ Database initialized")
 
+# --- УТИЛИТЫ ---
 def clean_phone(phone):
     clean = re.sub(r'[^\d]', '', str(phone))
     if clean.startswith('77') and len(clean) == 11: return '+' + clean
@@ -96,6 +102,7 @@ def calc_duration(start_iso, end_iso):
         return f"{mins} мин"
     except: return "0 мин"
 
+# --- СОСТОЯНИЯ ---
 class UserState(StatesGroup):
     waiting_numbers = State()
     waiting_help = State()
@@ -107,12 +114,13 @@ class AdminState(StatesGroup):
     help_reply = State()
     report_hours = State()
 
+# --- КЛАВИАТУРЫ ---
 def main_kb(user_id):
     kb = InlineKeyboardBuilder()
     kb.button(text="📥 Сдать номер", callback_data="sel_tariff")
     kb.button(text="👤 Профиль", callback_data="profile")
     kb.button(text="ℹ️ Помощь", callback_data="guide")
-    kb.button(text="🆘 Помощь", callback_data="ask_help")
+    kb.button(text="🆘 Поддержка", callback_data="ask_help")
     if user_id == ADMIN_ID: kb.button(text="⚡ Админ панель", callback_data="admin_main")
     kb.adjust(1, 2, 1, 1)
     return kb.as_markup()
@@ -132,6 +140,7 @@ def worker_kb_max(nid):
 def worker_active_kb(nid):
     return InlineKeyboardBuilder().button(text="📉 Слет", callback_data=f"w_drop_{nid}").as_markup()
 
+# --- ХЭНДЛЕРЫ: КОМАНДЫ ---
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
@@ -229,10 +238,9 @@ async def cmd_code(m: Message, command: CommandObject, bot: Bot):
     try:
         await bot.send_message(row['user_id'], f"🔔 Запрос кода\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}\n\nОтветьте сообщением")
         await m.reply("✅ Запрос отправлен") 
-        # ============================================
-# ЧАСТЬ 2 из 3 - CALLBACK ХЭНДЛЕРЫ
-# ============================================
-# ВСТАВЬТЕ ЭТУ ЧАСТЬ ПОСЛЕ ЧАСТИ 1
+    except: pass
+
+# --- ХЭНДЛЕРЫ: CALLBACK ---
 
 @router.callback_query(F.data == "guide")
 async def cb_guide(c: CallbackQuery):
@@ -509,11 +517,9 @@ async def cb_helpreply(c: CallbackQuery, state: FSMContext):
     await state.update_data(help_uid=uid)
     await state.set_state(AdminState.help_reply)
     await c.message.answer(f"✍️ Ответ для {uid}:")
-    except: await m.reply("❌ Ошибка")
-# ============================================
-# ЧАСТЬ 3 из 3 - FSM ХЭНДЛЕРЫ И МОНИТОРИНГ
-# ============================================
-# ВСТАВЬТЕ ЭТУ ЧАСТЬ ПОСЛЕ ЧАСТИ 2
+    await c.answer()
+
+# --- ХЭНДЛЕРЫ: FSM (СОСТОЯНИЯ) ---
 
 @router.message(UserState.waiting_numbers)
 async def fsm_nums(m: Message, state: FSMContext):
@@ -610,7 +616,10 @@ async def fsm_rep(m: Message, state: FSMContext):
         gn = r['group_name'] if r['group_name'] else "-"
         w.writerow([r['id'], r['user_id'], r['phone'], r['status'], gn, r['tariff_name'], format_time(r['created_at']), format_time(r['start_time']), format_time(r['end_time']), duration])
     out.seek(0)
-    await m.answer_document(BufferedInputFile(out.getvalue().encode(), filename=f"report_{hours}h.csv"), caption=f"📊 Отчет за {hours}ч")
+    doc = BufferedInputFile(out.getvalue().encode(), filename=f"report_{hours}h.csv")
+    await m.answer_document(doc, caption=f"📊 Отчет за {hours}ч")
+
+# --- ПРОЧИЕ ХЭНДЛЕРЫ И LOOP ---
 
 @router.message(F.photo & F.caption)
 async def handle_photo(m: Message, bot: Bot):
@@ -661,6 +670,7 @@ async def monitor(bot: Bot):
                             await bot.send_message(w['user_id'], f"⏰ Время вышло\n{w['phone']} отменен")
                             if w['worker_chat_id']: await bot.send_message(chat_id=w['worker_chat_id'], message_thread_id=w['worker_thread_id'] if w['worker_thread_id'] else None, text="⚠️ Таймаут кода!")
                         except: pass
+                
                 qrows = await (await db.execute("SELECT id, user_id, created_at, last_ping FROM numbers WHERE status='queue'")).fetchall()
                 for r in qrows:
                     las = r['last_ping'] if r['last_ping'] else r['created_at']
@@ -685,6 +695,7 @@ async def monitor(bot: Bot):
 
 async def main():
     await init_db()
+    if not TOKEN: sys.exit("FATAL: No BOT_TOKEN")
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
