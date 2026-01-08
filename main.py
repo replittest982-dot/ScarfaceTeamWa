@@ -26,7 +26,7 @@ except ImportError:
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-DB_NAME = "bot_final.db"
+DB_NAME = "bot_mega.db"
 
 # Таймеры
 AFK_CHECK_MINUTES = 8
@@ -62,6 +62,7 @@ async def init_db():
                 first_name TEXT,
                 is_approved INTEGER DEFAULT 0,
                 is_banned INTEGER DEFAULT 0,
+                last_afk_check TEXT,
                 reg_date TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -83,7 +84,6 @@ async def init_db():
                 end_time TEXT,
                 last_ping TEXT,
                 wait_code_start TEXT,
-                code_type TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -119,7 +119,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '24/7')")
         
         await db.commit()
-    logger.info("✅ Database initialized")
+    logger.info("✅ Database initialized - MEGA VERSION")
 
 # ==========================================
 # УТИЛИТЫ
@@ -186,7 +186,7 @@ def main_kb(user_id):
     kb = InlineKeyboardBuilder()
     kb.button(text="📥 Сдать номер", callback_data="sel_tariff")
     kb.button(text="👤 Профиль", callback_data="profile")
-    kb.button(text="ℹ️ Помощь", callback_data="guide")
+    kb.button(text="ℹ️ Информация", callback_data="guide")
     kb.button(text="🆘 Помощь", callback_data="ask_help")
     if user_id == ADMIN_ID:
         kb.button(text="⚡ Админ панель", callback_data="admin_main")
@@ -207,12 +207,6 @@ def worker_kb_max(nid):
 
 def worker_active_kb(nid):
     return InlineKeyboardBuilder().button(text="📉 Слет", callback_data=f"w_drop_{nid}").as_markup()
-
-def code_type_kb(nid):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📱 QR код", callback_data=f"code_qr_{nid}")
-    kb.button(text="🔢 Обычный код", callback_data=f"code_sms_{nid}")
-    return kb.as_markup()
 
 # ==========================================
 # КОМАНДЫ
@@ -452,15 +446,22 @@ async def cb_profile(c: CallbackQuery):
     uid = c.from_user.id
     
     async with get_db() as db:
+        # Всего номеров
         total = (await (await db.execute(
             "SELECT COUNT(*) FROM numbers WHERE user_id=?", (uid,)
         )).fetchone())[0]
         
+        # В работе
         active = (await (await db.execute(
-            "SELECT COUNT(*) FROM numbers WHERE user_id=? AND status='active'", (uid,)
+            "SELECT COUNT(*) FROM numbers WHERE user_id=? AND status IN ('work', 'active')", (uid,)
         )).fetchone())[0]
         
-        # Позиция в очереди
+        # В очереди
+        in_queue = (await (await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE user_id=? AND status='queue'", (uid,)
+        )).fetchone())[0]
+        
+        # Позиция в очереди (первый номер юзера)
         my_first = await (await db.execute(
             "SELECT id FROM numbers WHERE user_id=? AND status='queue' ORDER BY id ASC LIMIT 1",
             (uid,)
@@ -472,20 +473,34 @@ async def cb_profile(c: CallbackQuery):
                 "SELECT COUNT(*) FROM numbers WHERE status='queue' AND id < ?",
                 (my_first[0],)
             )).fetchone())[0] + 1
+        
+        # Последние 3 номера
+        recent = await (await db.execute(
+            "SELECT phone, status, tariff_price FROM numbers WHERE user_id=? ORDER BY id DESC LIMIT 3",
+            (uid,)
+        )).fetchall()
     
     kb = InlineKeyboardBuilder()
     kb.button(text="📝 История", callback_data="my_nums")
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
     
-    await c.message.edit_text(
-        f"👤 Личный кабинет\n{SEP}\n"
-        f"🆔 ID: {uid}\n"
-        f"📦 Всего сдано: {total}\n"
-        f"🔥 В работе: {active}\n"
-        f"🕒 Позиция в очереди: {q_pos if q_pos else '-'}",
-        reply_markup=kb.as_markup()
-    )
+    txt = f"👤 Личный кабинет\n{SEP}\n"
+    txt += f"🆔 ID: {uid}\n"
+    txt += f"📦 Всего сдано: {total}\n"
+    txt += f"🟡 В очереди: {in_queue}\n"
+    txt += f"🔥 В работе: {active}\n\n"
+    
+    if q_pos:
+        txt += f"🕒 Ваша позиция: {q_pos}\n\n"
+    
+    if recent:
+        txt += f"📱 Последние номера:\n"
+        for r in recent:
+            icon = "🟡" if r['status'] == 'queue' else "🟢" if r['status'] in ('work', 'active') else "✅" if r['status'] == 'finished' else "❌"
+            txt += f"{icon} {mask_phone(r['phone'], uid)} | {r['tariff_price']}\n"
+    
+    await c.message.edit_text(txt, reply_markup=kb.as_markup())
 
 @router.callback_query(F.data == "my_nums")
 async def cb_my_nums(c: CallbackQuery):
@@ -498,13 +513,13 @@ async def cb_my_nums(c: CallbackQuery):
         )).fetchall()
     
     kb = InlineKeyboardBuilder()
-    txt = f"📝 Последние 10 номеров\n{SEP}\n"
+    txt = f"📝 История номеров\n{SEP}\n"
     
     if not rows:
-        txt += "📭 История пуста"
+        txt += "📭 Пусто"
     else:
         for r in rows:
-            icon = "🟡" if r['status'] == 'queue' else "🟢" if r['status'] == 'active' else "✅" if r['status'] == 'finished' else "❌"
+            icon = "🟡" if r['status'] == 'queue' else "🟢" if r['status'] in ('work', 'active') else "✅" if r['status'] == 'finished' else "❌"
             txt += f"{icon} {mask_phone(r['phone'], uid)} | {r['tariff_price']}\n"
             
             if r['status'] == 'queue':
@@ -633,7 +648,7 @@ async def cb_w_act(c: CallbackQuery, bot: Bot):
         await db.commit()
     
     await c.message.edit_text(
-        f"✅ Номер встал",
+        "✅ Номер встал",
         reply_markup=worker_active_kb(nid)
     )
     
@@ -664,7 +679,7 @@ async def cb_w_skip(c: CallbackQuery, bot: Bot):
         )
         await db.commit()
     
-    await c.message.edit_text("⏭ Пропуск (номер вернулся в очередь)")
+    await c.message.edit_text("⏭ Пропуск")
     
     try:
         await bot.send_message(
@@ -699,7 +714,7 @@ async def cb_w_finish(c: CallbackQuery, bot: Bot):
         await db.commit()
     
     if is_drop:
-        msg = f"📉 Слет"
+        msg = "📉 Слет"
         user_msg = f"📉 Ваш номер слетел\n{SEP}\n⏱ Время работы: {duration}"
     else:
         msg = "❌ Ошибка"
@@ -753,12 +768,12 @@ async def cb_acc(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("afk_ok_"))
 async def cb_afk(c: CallbackQuery):
-    nid = c.data.split("_")[2]
+    uid = c.from_user.id
     
     async with get_db() as db:
         await db.execute(
-            "UPDATE numbers SET last_ping=? WHERE id=?",
-            (get_now(), nid)
+            "UPDATE users SET last_afk_check=? WHERE user_id=?",
+            (get_now(), uid)
         )
         await db.commit()
     
@@ -793,12 +808,10 @@ async def cb_all_queue(c: CallbackQuery):
         return
     
     async with get_db() as db:
-        # Все номера в очереди
         queue = await (await db.execute(
             "SELECT id, phone, tariff_name, created_at FROM numbers WHERE status='queue' ORDER BY id ASC"
         )).fetchall()
         
-        # Все номера в работе
         active = await (await db.execute(
             "SELECT id, phone, tariff_name, worker_id, start_time FROM numbers WHERE status IN ('work', 'active') ORDER BY id ASC"
         )).fetchall()
@@ -807,19 +820,19 @@ async def cb_all_queue(c: CallbackQuery):
     
     txt += f"🟡 В ОЧЕРЕДИ ({len(queue)}):\n"
     if queue:
-        for i, r in enumerate(queue[:20], 1):  # Показываем первые 20
+        for i, r in enumerate(queue[:20], 1):
             txt += f"{i}. {r['phone']} | {r['tariff_name']}\n"
         if len(queue) > 20:
-            txt += f"...и еще {len(queue) - 20} номеров\n"
+            txt += f"...и еще {len(queue) - 20}\n"
     else:
         txt += "Пусто\n"
     
     txt += f"\n🟢 В РАБОТЕ ({len(active)}):\n"
     if active:
         for r in active[:20]:
-            txt += f"📱 {r['phone']} | {r['tariff_name']} | Воркер: {r['worker_id']}\n"
+            txt += f"📱 {r['phone']} | {r['tariff_name']} | ID: {r['worker_id']}\n"
         if len(active) > 20:
-            txt += f"...и еще {len(active) - 20} номеров\n"
+            txt += f"...и еще {len(active) - 20}\n"
     else:
         txt += "Пусто\n"
     
@@ -857,7 +870,7 @@ async def cb_mgr(c: CallbackQuery):
     kb.adjust(1)
     
     await c.message.edit_text(
-        "🏢 Управление группами\n{SEP}\nВыберите группу:",
+        "🏢 Управление группами\n{SEP}",
         reply_markup=kb.as_markup()
     )
 
@@ -876,10 +889,7 @@ async def cb_stop_g(c: CallbackQuery, bot: Bot):
         )).fetchone()
         
         if not g:
-            return await c.answer(
-                f"❌ Группа {gn} не привязана!",
-                show_alert=True
-            )
+            return await c.answer(f"❌ Группа {gn} не привязана!", show_alert=True)
         
         cid, title = g['chat_id'], g['title']
         
@@ -955,17 +965,11 @@ async def cb_adm_t(c: CallbackQuery):
     
     kb = InlineKeyboardBuilder()
     for t in ts:
-        kb.button(
-            text=f"✏️ {t['name']}",
-            callback_data=f"ed_{t['name']}"
-        )
+        kb.button(text=f"✏️ {t['name']}", callback_data=f"ed_{t['name']}")
     kb.button(text="🔙 Назад", callback_data="admin_main")
     kb.adjust(1)
     
-    await c.message.edit_text(
-        "🛠 Выберите тариф:",
-        reply_markup=kb.as_markup()
-    )
+    await c.message.edit_text("🛠 Выберите тариф:", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data.startswith("ed_"))
 async def cb_ed_t(c: CallbackQuery, state: FSMContext):
@@ -976,10 +980,7 @@ async def cb_ed_t(c: CallbackQuery, state: FSMContext):
     await state.update_data(target=target)
     await state.set_state(AdminState.edit_price)
     
-    await c.message.edit_text(
-        f"1️⃣ Введите ЦЕНУ для {target}\n"
-        f"Пример: 50₽, 10$"
-    )
+    await c.message.edit_text(f"1️⃣ Введите ЦЕНУ для {target}\nПример: 50₽, 10$")
 
 @router.callback_query(F.data == "adm_reports")
 async def cb_adm_r(c: CallbackQuery, state: FSMContext):
@@ -989,8 +990,7 @@ async def cb_adm_r(c: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.report_hours)
     
     await c.message.edit_text(
-        "📊 Выберите за какой период хотите получить отчет\n"
-        "(до 120 часов)\n\n"
+        "📊 Выберите период (до 120 часов)\n\n"
         "Введите количество часов:"
     )
 
@@ -1000,7 +1000,7 @@ async def cb_cast(c: CallbackQuery, state: FSMContext):
         return
     
     await state.set_state(AdminState.waiting_broadcast)
-    await c.message.edit_text("📢 Пришлите пост для рассылки:")
+    await c.message.edit_text("📢 Пришлите пост:")
 
 @router.callback_query(F.data.startswith("helpreply_"))
 async def cb_helpreply(c: CallbackQuery, state: FSMContext):
@@ -1057,8 +1057,7 @@ async def fsm_help(m: Message, state: FSMContext, bot: Bot):
             reply_markup=kb.as_markup()
         )
         await m.answer(
-            "✅ Запрос отправлен\n"
-            "Ответ будет направлен вам",
+            "✅ Запрос отправлен\nОтвет будет направлен вам",
             reply_markup=main_kb(m.from_user.id)
         )
     except Exception as e:
@@ -1073,7 +1072,7 @@ async def fsm_helpreply(m: Message, state: FSMContext, bot: Bot):
     try:
         await bot.send_message(
             data['help_uid'],
-            f"👨‍💻 Ответ на ваш запрос:\n{SEP}\n{m.text}"
+            f"👨‍💻 Ответ:\n{SEP}\n{m.text}"
         )
         await m.answer("✅ Ответ отправлен")
     except:
@@ -1103,8 +1102,8 @@ async def fsm_cast(m: Message, state: FSMContext, bot: Bot):
     
     await msg.edit_text(
         f"📢 Рассылка завершена\n{SEP}\n"
-        f"✅ Доставлено: {success}\n"
-        f"❌ Ошибок: {fail}\n"
+        f"✅ {success}\n"
+        f"❌ {fail}\n"
         f"📊 Всего: {len(users)}"
     )
 
@@ -1112,10 +1111,7 @@ async def fsm_cast(m: Message, state: FSMContext, bot: Bot):
 async def fsm_ep(m: Message, state: FSMContext):
     await state.update_data(price=m.text)
     await state.set_state(AdminState.edit_time)
-    await m.answer(
-        f"2️⃣ Введите ВРЕМЯ РАБОТЫ\n"
-        f"Пример: 10:00-22:00 МСК, 24/7"
-    )
+    await m.answer(f"2️⃣ Введите ВРЕМЯ РАБОТЫ\nПример: 10:00-22:00 МСК, 24/7")
 
 @router.message(AdminState.edit_time)
 async def fsm_et(m: Message, state: FSMContext):
@@ -1129,11 +1125,7 @@ async def fsm_et(m: Message, state: FSMContext):
         await db.commit()
     
     await state.clear()
-    await m.answer(
-        f"✅ Тариф обновлен!\n{SEP}\n"
-        f"💰 {data['price']}\n"
-        f"⏰ {m.text}"
-    )
+    await m.answer(f"✅ Тариф обновлен!\n{SEP}\n💰 {data['price']}\n⏰ {m.text}")
 
 @router.message(AdminState.report_hours)
 async def fsm_rep(m: Message, state: FSMContext):
@@ -1142,9 +1134,9 @@ async def fsm_rep(m: Message, state: FSMContext):
     try:
         hours = int(m.text)
         if hours < 1 or hours > 120:
-            return await m.answer("❌ Введите число от 1 до 120")
+            return await m.answer("❌ От 1 до 120")
     except:
-        return await m.answer("❌ Введите корректное число")
+        return await m.answer("❌ Введите число")
     
     cut_time = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     
@@ -1245,25 +1237,16 @@ async def handle_msg(m: Message, bot: Bot, state: FSMContext):
             hdr = f"📩 ОТВЕТ ЮЗЕРА\n📱 {row['phone']}\n{SEP}\n"
             
             if m.text:
-                await bot.send_message(
-                    tc,
-                    message_thread_id=tt,
-                    text=f"{hdr}💬 {m.text}"
-                )
+                await bot.send_message(tc, message_thread_id=tt, text=f"{hdr}💬 {m.text}")
             elif m.photo:
-                await bot.send_photo(
-                    tc,
-                    message_thread_id=tt,
-                    photo=m.photo[-1].file_id,
-                    caption=f"{hdr}📸"
-                )
+                await bot.send_photo(tc, message_thread_id=tt, photo=m.photo[-1].file_id, caption=f"{hdr}📸")
             
             await m.answer("✅ Отправлено")
         except:
             await m.answer("❌ Ошибка")
 
 # ==========================================
-# МОНИТОРИНГ
+# МОНИТОРИНГ (УЛУЧШЕННЫЙ - 1 ПРОВЕРКА НА ЮЗЕРА)
 # ==========================================
 async def monitor(bot: Bot):
     while True:
@@ -1272,7 +1255,7 @@ async def monitor(bot: Bot):
             now = datetime.now(timezone.utc)
             
             async with get_db() as db:
-                # Таймаут кода
+                # 1. Таймаут кода
                 waiters = await (await db.execute("""
                     SELECT id, user_id, phone, worker_chat_id, worker_thread_id, wait_code_start 
                     FROM numbers 
@@ -1288,10 +1271,7 @@ async def monitor(bot: Bot):
                         )
                         
                         try:
-                            await bot.send_message(
-                                w['user_id'],
-                                f"⏰ Время вышло\n{w['phone']} отменен"
-                            )
+                            await bot.send_message(w['user_id'], f"⏰ Время вышло\n{w['phone']} отменен")
                             
                             if w['worker_chat_id']:
                                 await bot.send_message(
@@ -1302,47 +1282,75 @@ async def monitor(bot: Bot):
                         except:
                             pass
                 
-                # AFK проверка
-                qrows = await (await db.execute("""
-                    SELECT id, user_id, created_at, last_ping 
-                    FROM numbers 
-                    WHERE status='queue'
+                # 2. AFK проверка (1 РАЗ НА ЮЗЕРА!)
+                users_in_queue = await (await db.execute("""
+                    SELECT DISTINCT user_id, last_afk_check 
+                    FROM users 
+                    WHERE user_id IN (SELECT user_id FROM numbers WHERE status='queue')
                 """)).fetchall()
                 
-                for r in qrows:
-                    las = r['last_ping'] if r['last_ping'] else r['created_at']
+                for u in users_in_queue:
+                    last_check = u['last_afk_check']
                     
-                    if str(las).startswith("PENDING_"):
-                        pt = datetime.fromisoformat(las.split("_")[1])
+                    if not last_check:
+                        # Первая проверка
+                        kb = InlineKeyboardBuilder().button(
+                            text="👋 Я тут!",
+                            callback_data=f"afk_ok_{u['user_id']}"
+                        ).as_markup()
+                        
+                        try:
+                            await bot.send_message(
+                                u['user_id'],
+                                f"⚠️ Проверка активности!\n{SEP}\nНажмите кнопку",
+                                reply_markup=kb
+                            )
+                            await db.execute(
+                                "UPDATE users SET last_afk_check=? WHERE user_id=?",
+                                (f"PENDING_{get_now()}", u['user_id'])
+                            )
+                        except:
+                            pass
+                    elif str(last_check).startswith("PENDING_"):
+                        # Удаляем все номера юзера если не ответил
+                        pt = datetime.fromisoformat(last_check.split("_")[1])
                         if (now - pt).total_seconds() / 60 >= AFK_KICK_MINUTES:
-                            await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],))
+                            await db.execute(
+                                "DELETE FROM numbers WHERE user_id=? AND status='queue'",
+                                (u['user_id'],)
+                            )
+                            await db.execute(
+                                "UPDATE users SET last_afk_check=NULL WHERE user_id=?",
+                                (u['user_id'],)
+                            )
                             try:
                                 await bot.send_message(
-                                    r['user_id'],
-                                    "❌ Номер удален (AFK)"
+                                    u['user_id'],
+                                    "❌ Все номера удалены (AFK)"
                                 )
                             except:
                                 pass
                     else:
-                        la = datetime.fromisoformat(las)
-                        if (now - la).total_seconds() / 60 >= AFK_CHECK_MINUTES:
+                        # Проверяем время последней проверки
+                        lc = datetime.fromisoformat(last_check)
+                        if (now - lc).total_seconds() / 60 >= AFK_CHECK_MINUTES:
                             kb = InlineKeyboardBuilder().button(
                                 text="👋 Я тут!",
-                                callback_data=f"afk_ok_{r['id']}"
+                                callback_data=f"afk_ok_{u['user_id']}"
                             ).as_markup()
                             
                             try:
                                 await bot.send_message(
-                                    r['user_id'],
+                                    u['user_id'],
                                     f"⚠️ Проверка активности!\n{SEP}\nНажмите кнопку",
                                     reply_markup=kb
                                 )
                                 await db.execute(
-                                    "UPDATE numbers SET last_ping=? WHERE id=?",
-                                    (f"PENDING_{get_now()}", r['id'])
+                                    "UPDATE users SET last_afk_check=? WHERE user_id=?",
+                                    (f"PENDING_{get_now()}", u['user_id'])
                                 )
                             except:
-                                await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],))
+                                pass
                 
                 await db.commit()
         except Exception as e:
@@ -1363,7 +1371,7 @@ async def main():
     
     asyncio.create_task(monitor(bot))
     
-    logger.info("🚀 BOT STARTED - FINAL VERSION")
+    logger.info("🚀 BOT MEGA VERSION STARTED")
     
     try:
         await dp.start_polling(bot)
