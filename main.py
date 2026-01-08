@@ -33,7 +33,7 @@ DB_NAME = "bot_final.db"
 
 SEP = "━━━━━━━━━━━━━━━━━━━━"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 router = Router()
 
@@ -52,12 +52,44 @@ async def get_db():
 
 async def init_db():
     async with get_db() as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,is_approved INTEGER DEFAULT 0,is_banned INTEGER DEFAULT 0,reg_date TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                is_approved INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
+                reg_date TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
-        await db.execute("""CREATE TABLE IF NOT EXISTS numbers (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,phone TEXT,phone_hash TEXT,tariff_name TEXT,tariff_price TEXT,work_time TEXT,status TEXT DEFAULT 'queue',worker_id INTEGER DEFAULT 0,worker_chat_id INTEGER DEFAULT 0,worker_thread_id INTEGER DEFAULT 0,start_time TEXT,end_time TEXT,last_ping TEXT,wait_code_start TEXT,code_type TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        # Добавлено поле afk_level для контроля уведомлений (0=нет, 1=5мин, 2=3мин, 3=1мин)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS numbers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                phone TEXT,
+                phone_hash TEXT,
+                tariff_name TEXT,
+                tariff_price TEXT,
+                work_time TEXT,
+                status TEXT DEFAULT 'queue',
+                worker_id INTEGER DEFAULT 0,
+                worker_chat_id INTEGER DEFAULT 0,
+                worker_thread_id INTEGER DEFAULT 0,
+                start_time TEXT,
+                end_time TEXT,
+                last_ping TEXT,
+                afk_level INTEGER DEFAULT 0,
+                wait_code_start TEXT,
+                code_type TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
-        # Индекс для быстрой проверки дублей в активных статусах
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_numbers ON numbers(phone_hash,status) WHERE status IN('queue','work','active')")
+        # Индекс для быстрой проверки дублей и работы очереди
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_numbers ON numbers(phone_hash, status) WHERE status IN('queue','work','active')")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_status_afk ON numbers(status, afk_level)")
         
         await db.execute("""CREATE TABLE IF NOT EXISTS tariffs (name TEXT PRIMARY KEY,price TEXT,work_time TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS groups (group_num INTEGER PRIMARY KEY,chat_id INTEGER,title TEXT)""")
@@ -200,23 +232,45 @@ async def cmd_stopwork(m: Message):
         await db.commit()
     await m.reply("🛑 Топик отключен.")
 
+# === ИСПРАВЛЕНИЕ RACE CONDITION ===
 @router.message(Command("num"))
 async def cmd_num(m: Message, bot: Bot):
     tid = m.message_thread_id if m.is_topic_message else 0
+    
+    # Используем транзакцию IMMEDIATE, чтобы заблокировать запись для других воркеров
     async with get_db() as db:
-        conf = await (await db.execute("SELECT value FROM config WHERE key=?", (f"topic_{m.chat.id}_{tid}",))).fetchone()
-        if not conf: return await m.reply("❌ Топик не настроен")
-        tariff_name = conf['value']
-        row = await (await db.execute("SELECT * FROM numbers WHERE status='queue' AND tariff_name=? ORDER BY id ASC LIMIT 1", (tariff_name,))).fetchone()
-        if not row: return await m.reply("📭 Очередь пуста")
-        await db.execute("UPDATE numbers SET status='work', worker_id=?, worker_chat_id=?, worker_thread_id=?, start_time=? WHERE id=?", (m.from_user.id, m.chat.id, tid, get_now(), row['id']))
-        await db.commit()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            conf = await (await db.execute("SELECT value FROM config WHERE key=?", (f"topic_{m.chat.id}_{tid}",))).fetchone()
+            if not conf: 
+                await db.rollback()
+                return await m.reply("❌ Топик не настроен")
+            
+            tariff_name = conf['value']
+            
+            # Выбираем номер и сразу блокируем его (логически) обновлением
+            row = await (await db.execute("SELECT * FROM numbers WHERE status='queue' AND tariff_name=? ORDER BY id ASC LIMIT 1", (tariff_name,))).fetchone()
+            
+            if not row: 
+                await db.commit() # Очередь пуста, коммитим пустую транзакцию
+                return await m.reply("📭 Очередь пуста")
+            
+            # Атомарное обновление
+            await db.execute("UPDATE numbers SET status='work', worker_id=?, worker_chat_id=?, worker_thread_id=?, start_time=? WHERE id=?", (m.from_user.id, m.chat.id, tid, get_now(), row['id']))
+            await db.commit()
+            
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error in /num: {e}")
+            return await m.reply("❌ Ошибка при получении номера")
+
     if "MAX" in tariff_name.upper():
         msg = f"🚀 Вы взяли номер\n{SEP}\n📱 {row['phone']}\n\nКод: /code {row['phone']}"
         kb = worker_kb_max(row['id'])
     else:
         msg = f"🚀 Вы взяли номер\n{SEP}\n📱 {row['phone']}\n\nКод: /sms {row['phone']} текст"
         kb = worker_kb_whatsapp(row['id'])
+    
     await m.answer(msg, reply_markup=kb)
     try: await bot.send_message(row['user_id'], f"⚡ Ваш номер взяли\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}\nОжидайте код")
     except: pass
@@ -405,7 +459,8 @@ async def cb_acc(c: CallbackQuery, bot: Bot):
 async def cb_afk(c: CallbackQuery):
     nid = c.data.split("_")[2]
     async with get_db() as db:
-        await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (get_now(), nid))
+        # При подтверждении сбрасываем уровень на 0 и обновляем пинг
+        await db.execute("UPDATE numbers SET last_ping=?, afk_level=0 WHERE id=?", (get_now(), nid))
         await db.commit()
     await c.message.delete()
     await c.answer("✅ Вы в очереди!")
@@ -427,7 +482,6 @@ async def cb_adm(c: CallbackQuery):
 async def cb_all_queue(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
     async with get_db() as db:
-        # Увеличен лимит отображения
         queue = await (await db.execute("SELECT id, phone, tariff_name FROM numbers WHERE status='queue' ORDER BY id ASC LIMIT 50")).fetchall()
         active = await (await db.execute("SELECT id, phone, tariff_name, worker_id FROM numbers WHERE status IN ('work', 'active') ORDER BY id ASC LIMIT 50")).fetchall()
     
@@ -441,9 +495,7 @@ async def cb_all_queue(c: CallbackQuery):
         for r in active: txt += f"📱 {r['phone']} | {r['tariff_name']} | W:{r['worker_id']}\n"
     else: txt += "Пусто\n"
     
-    # Защита от слишком длинного сообщения
     if len(txt) > 4000: txt = txt[:4000] + "\n...обрезано..."
-    
     kb = InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="admin_main")
     await c.message.edit_text(txt, reply_markup=kb.as_markup())
 
@@ -551,12 +603,13 @@ async def fsm_nums(m: Message, state: FSMContext):
     async with get_db() as db:
         for ph in valid:
             ph_hash = get_phone_hash(ph)
-            # ПРОВЕРКА: Если номер СЕЙЧАС в работе/очереди - нельзя. Если был отработан - можно.
+            # ПРОВЕРКА ДУБЛЕЙ: Только в активных статусах
             exists = await (await db.execute("SELECT id FROM numbers WHERE phone_hash=? AND status IN ('queue', 'work', 'active')", (ph_hash,))).fetchone()
             if exists:
                 duplicates.append(ph)
                 continue
-            await db.execute("INSERT INTO numbers (user_id, phone, phone_hash, tariff_name, tariff_price, work_time, last_ping) VALUES (?, ?, ?, ?, ?, ?, ?)", (m.from_user.id, ph, ph_hash, data['tariff'], data['price'], data['work_time'], get_now()))
+            # Устанавливаем afk_level=0 и last_ping=now при создании
+            await db.execute("INSERT INTO numbers (user_id, phone, phone_hash, tariff_name, tariff_price, work_time, last_ping, afk_level) VALUES (?, ?, ?, ?, ?, ?, ?, 0)", (m.from_user.id, ph, ph_hash, data['tariff'], data['price'], data['work_time'], get_now()))
             added += 1
         await db.commit()
     msg = f"✅ Добавлено: {added}\n"
@@ -678,66 +731,94 @@ async def handle_msg(m: Message, bot: Bot, state: FSMContext):
         except: await m.answer("❌ Ошибка")
 
 # ==========================================
-# МОНИТОРИНГ (AFK СИСТЕМА v2)
+# МОНИТОРИНГ (AFK СИСТЕМА v3 FIXED)
 # ==========================================
 async def monitor(bot: Bot):
+    logger.info("Monitor started")
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30) # Проверка каждые 30 секунд для точности
             now = datetime.now(timezone.utc)
+            
             async with get_db() as db:
-                # 1. Проверка таймаута на КОД (оставил 5 минут)
+                # 1. Проверка таймаута на КОД (5 минут)
                 waiters = await (await db.execute("SELECT id, user_id, phone, worker_chat_id, worker_thread_id, wait_code_start FROM numbers WHERE status='active' AND wait_code_start IS NOT NULL")).fetchall()
                 for w in waiters:
                     st = datetime.fromisoformat(w['wait_code_start'])
-                    if (now - st).total_seconds() / 60 >= 5: # 5 минут на ввод кода
+                    if (now - st).total_seconds() / 60 >= 5:
+                        logger.info(f"Code timeout for {w['id']}")
                         await db.execute("UPDATE numbers SET status='dead', end_time=?, wait_code_start=NULL WHERE id=?", (get_now(), w['id']))
                         try:
-                            await bot.send_message(w['user_id'], f"⏰ Время вышло\n{w['phone']} отменен")
-                            if w['worker_chat_id']: await bot.send_message(chat_id=w['worker_chat_id'], message_thread_id=w['worker_thread_id'] if w['worker_thread_id'] else None, text="⚠️ Таймаут кода!")
+                            await bot.send_message(w['user_id'], f"⏰ Время ожидания кода вышло\n{w['phone']} отменен")
+                            if w['worker_chat_id']: 
+                                await bot.send_message(chat_id=w['worker_chat_id'], message_thread_id=w['worker_thread_id'] if w['worker_thread_id'] else None, text="⚠️ Таймаут кода (5 мин)!")
                         except: pass
+
+                # 2. AFK СИСТЕМА (СТРОГО 5-3-1, БЕЗ ДУБЛЕЙ)
+                # Выбираем только тех, кто в очереди
+                qrows = await (await db.execute("SELECT id, user_id, created_at, last_ping, afk_level FROM numbers WHERE status='queue'")).fetchall()
                 
-                # 2. AFK СИСТЕМА (5-3-1)
-                qrows = await (await db.execute("SELECT id, user_id, created_at, last_ping FROM numbers WHERE status='queue'")).fetchall()
                 for r in qrows:
-                    raw_ping = r['last_ping'] if r['last_ping'] else r['created_at']
+                    # Определяем время последнего изменения статуса
+                    # Если last_ping есть, берем его, иначе created_at
+                    last_time_str = r['last_ping'] if r['last_ping'] else r['created_at']
+                    # Очищаем старый формат WARN_ если вдруг остался в БД
+                    if str(last_time_str).startswith("WARN"):
+                        try: last_time_str = last_time_str.split("_")[-1]
+                        except: last_time_str = get_now()
                     
-                    # Разбираем состояние
-                    if str(raw_ping).startswith("WARN_"):
-                        # Уже идет стадия предупреждений
-                        parts = raw_ping.split("_")
-                        level = int(parts[1]) # 1, 2 или 3
-                        ts = datetime.fromisoformat(parts[2])
-                        delta_min = (now - ts).total_seconds() / 60
+                    last_time = datetime.fromisoformat(last_time_str)
+                    diff_min = (now - last_time).total_seconds() / 60
+                    level = r['afk_level']
+                    
+                    new_level = level
+                    notify_text = None
+                    kick = False
+
+                    # Логика уровней
+                    # Level 0 -> 5 мин -> Level 1 (Уведомление "Вы тут?")
+                    if level == 0 and diff_min >= 5:
+                        new_level = 1
+                        notify_text = "⏳ Вы тут? Осталось 3 минуты! Нажмите кнопку ниже."
+                        kb = InlineKeyboardBuilder().button(text="👋 Я тут!", callback_data=f"afk_ok_{r['id']}").as_markup()
+                    
+                    # Level 1 -> 2 мин -> Level 2 (Уведомление "Осталось 3 мин" -> тут ошибка в ТЗ, по логике 5-3-1:
+                    # 5 мин (увед) -> +3 мин (увед) -> +1 мин (кик).
+                    # Исправляем по вашему описанию: "Через 5 мин... Если не ответил через 2 мин... Если не ответил через 1 мин".
+                    
+                    # Реализуем по запросу: 5 (Увед 1) -> +2 (Увед 2 "1 минута") -> +1 (Кик)
+                    elif level == 1 and diff_min >= 2:
+                        new_level = 2
+                        notify_text = "⏳ ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ: Осталась 1 минута!"
+                        kb = None
                         
-                        if level == 1:
-                            if delta_min >= 2: # Прошло 2 минуты после первого вопроса (5+2=7 мин)
-                                await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (f"WARN_2_{get_now()}", r['id']))
-                                try: await bot.send_message(r['user_id'], "⏳ Вы тут? Осталось 3 минуты!")
-                                except: pass
-                        elif level == 2:
-                            if delta_min >= 2: # Прошло еще 2 минуты (7+2=9 мин)
-                                await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (f"WARN_3_{get_now()}", r['id']))
-                                try: await bot.send_message(r['user_id'], "⏳ ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ: 1 минута!")
-                                except: pass
-                        elif level == 3:
-                            if delta_min >= 1: # Прошла 1 минута (9+1=10 мин) -> КИК
-                                await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],))
-                                try: await bot.send_message(r['user_id'], "❌ Номер удален (AFK)")
-                                except: pass
-                                
-                    else:
-                        # Обычное ожидание (первые 5 минут)
-                        la = datetime.fromisoformat(raw_ping)
-                        if (now - la).total_seconds() / 60 >= 5:
-                            kb = InlineKeyboardBuilder().button(text="👋 Я тут!", callback_data=f"afk_ok_{r['id']}").as_markup()
+                    # Level 2 -> 1 мин -> Level 3 (Кик)
+                    elif level == 2 and diff_min >= 1:
+                        new_level = 3
+                        kick = True
+                        notify_text = "❌ Номер удален из очереди (AFK)"
+                        kb = None
+
+                    # Применяем изменения, если уровень повысился
+                    if new_level > level:
+                        if kick:
+                            logger.info(f"Kicking AFK user {r['user_id']} num {r['id']}")
+                            await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],))
+                        else:
+                            # Обновляем уровень и время, чтобы таймер пошел заново для следующего этапа
+                            await db.execute("UPDATE numbers SET afk_level=?, last_ping=? WHERE id=?", (new_level, get_now(), r['id']))
+                        
+                        # Отправляем уведомление
+                        if notify_text:
                             try:
-                                await bot.send_message(r['user_id'], f"⚠️ ПРОВЕРКА!\n{SEP}\nНажмите кнопку, чтобы остаться в очереди", reply_markup=kb)
-                                await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (f"WARN_1_{get_now()}", r['id']))
-                            except: await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],))
+                                await bot.send_message(r['user_id'], notify_text, reply_markup=kb)
+                            except Exception as e:
+                                logger.warning(f"Failed to notify {r['user_id']}: {e}")
+
                 await db.commit()
+                
         except Exception as e:
-            logger.error(f"Monitor: {e}")
+            logger.error(f"Monitor loop error: {e}")
             await asyncio.sleep(5)
 
 async def main():
