@@ -691,8 +691,9 @@ async def fsm_rep(m: Message, state: FSMContext):
 @router.message(F.photo & F.caption)
 async def handle_photo(m: Message, bot: Bot):
     """
-    ИСПРАВЛЕННЫЙ обработчик фото с командой /sms
-    Формат: Отправить фото с подписью "/sms +7999... текст текст"
+    Обработчик фото с командой /sms
+    Формат: Фото с подписью "/sms +7999... текст текст"
+    Отправляет СНАЧАЛА текст, ПОТОМ фото
     """
     if "/sms" not in m.caption.lower(): 
         return
@@ -721,18 +722,20 @@ async def handle_photo(m: Message, bot: Bot):
     if not row or row['worker_id'] != m.from_user.id:
         return await m.reply("❌ Не ваш номер")
     
-    # Отправляем фото пользователю с текстом
+    # Отправляем СНАЧАЛА текст, ПОТОМ фото
     try:
-        # Формируем caption
+        # 1. Отправляем текстовое сообщение
         if text_message:
-            caption = f"📩 {text_message}\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}"
-        else:
-            caption = f"📸 Фото от офиса\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}"
+            await bot.send_message(
+                row['user_id'], 
+                f"📩 {text_message}\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}"
+            )
         
+        # 2. Отправляем фото
         await bot.send_photo(
             row['user_id'], 
             m.photo[-1].file_id, 
-            caption=caption
+            caption=f"📸 Фото\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}"
         )
         
         # Подтверждение воркеру
