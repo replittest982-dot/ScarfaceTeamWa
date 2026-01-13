@@ -690,16 +690,57 @@ async def fsm_rep(m: Message, state: FSMContext):
 
 @router.message(F.photo & F.caption)
 async def handle_photo(m: Message, bot: Bot):
-    if "/sms" not in m.caption.lower(): return
-    ph = clean_phone(m.caption.split()[1]) if len(m.caption.split()) > 1 else None
-    if not ph: return await m.reply("⚠️ Формат: /sms +7...")
+    """
+    ИСПРАВЛЕННЫЙ обработчик фото с командой /sms
+    Формат: Отправить фото с подписью "/sms +7999... текст текст"
+    """
+    if "/sms" not in m.caption.lower(): 
+        return
+    
+    # Парсим команду: /sms +7999... текст текст текст
+    parts = m.caption.split(maxsplit=2)  # Разделяем на: ['/sms', '+7999...', 'остальной текст']
+    
+    if len(parts) < 2:
+        return await m.reply("⚠️ Формат: /sms +7... текст")
+    
+    # Очищаем номер телефона
+    ph = clean_phone(parts[1])
+    if not ph:
+        return await m.reply("⚠️ Неверный формат номера")
+    
+    # Извлекаем текст сообщения (если есть)
+    text_message = parts[2] if len(parts) > 2 else ""
+    
+    # Проверяем, что это номер воркера
     async with get_db() as db:
-        row = await (await db.execute("SELECT * FROM numbers WHERE phone=? AND status IN ('work','active')", (ph,))).fetchone()
-    if not row or row['worker_id'] != m.from_user.id: return await m.reply("❌ Не ваш номер")
+        row = await (await db.execute(
+            "SELECT * FROM numbers WHERE phone=? AND status IN ('work','active')", 
+            (ph,)
+        )).fetchone()
+    
+    if not row or row['worker_id'] != m.from_user.id:
+        return await m.reply("❌ Не ваш номер")
+    
+    # Отправляем фото пользователю с текстом
     try:
-        await bot.send_photo(row['user_id'], m.photo[-1].file_id, caption=f"🔔 ОТ ОФИСА\n{SEP}")
+        # Формируем caption
+        if text_message:
+            caption = f"📩 {text_message}\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}"
+        else:
+            caption = f"📸 Фото от офиса\n{SEP}\n📱 {mask_phone(row['phone'], row['user_id'])}"
+        
+        await bot.send_photo(
+            row['user_id'], 
+            m.photo[-1].file_id, 
+            caption=caption
+        )
+        
+        # Подтверждение воркеру
         await m.react([ReactionTypeEmoji(emoji="🔥")])
-    except: await m.reply("❌ Ошибка")
+        
+    except Exception as e:
+        logger.error(f"Failed to send photo: {e}")
+        await m.reply("❌ Ошибка отправки")
 
 @router.message(F.chat.type == "private")
 async def handle_msg(m: Message, bot: Bot, state: FSMContext):
