@@ -27,9 +27,11 @@ except ImportError:
 # ==========================================
 # КОНФИГУРАЦИЯ
 # ==========================================
+# Загружаем переменные окружения (Bothost friendly)
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = "bot_mega_v30.db"
+ADMIN_ID_STR = os.getenv("ADMIN_ID", "0")
+ADMIN_ID = int(ADMIN_ID_STR) if ADMIN_ID_STR.isdigit() else 0
+DB_NAME = "fast_team_v30.db" # Обновил имя БД под версию
 
 # Таймеры (в минутах)
 AFK_CHECK_MINUTES = 8   
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 if not TOKEN or "YOUR_TOKEN" in TOKEN:
-    sys.exit("❌ FATAL: BOT_TOKEN не указан!")
+    sys.exit("❌ FATAL: BOT_TOKEN не указан в .env или системе!")
 
 # ==========================================
 # БАЗА ДАННЫХ
@@ -62,9 +64,13 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, 
                 is_approved INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, 
-                reg_date TEXT DEFAULT CURRENT_TIMESTAMP
+                reg_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_afk_check TEXT
             )
         """)
+        # Добавил last_afk_check в users, чтобы не крашилось если его нет,
+        # но лучше миграцию делать отдельно. В новом деплое создастся.
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS numbers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, 
@@ -79,11 +85,11 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS groups (group_num INTEGER PRIMARY KEY, chat_id INTEGER, title TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
         
-        # Дефолт
+        # Дефолт тарифы
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('WhatsApp','50₽','10:00-22:00 МСК')")
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('MAX','10$','24/7')")
         await db.commit()
-    logger.info("✅ Database initialized (Mega V30.1)")
+    logger.info("✅ Database initialized (FAST TEAM v30.2)")
 
 # ==========================================
 # УТИЛИТЫ
@@ -107,14 +113,6 @@ def format_time(iso_str):
     try: return (datetime.fromisoformat(iso_str) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
     except: return "-"
 
-def calc_duration(start_iso, end_iso):
-    try:
-        s = datetime.fromisoformat(start_iso)
-        e = datetime.fromisoformat(end_iso)
-        mins = int((e - s).total_seconds() / 60)
-        return f"{mins} мин"
-    except: return "0 мин"
-
 # ==========================================
 # FSM & КЛАВИАТУРЫ
 # ==========================================
@@ -124,10 +122,6 @@ class UserState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_broadcast = State()
-    edit_price = State()
-    edit_time = State()
-    help_reply = State()
-    # Новые стейты для отчета
     report_wait_date = State() 
     report_wait_hour = State()
 
@@ -157,7 +151,7 @@ def worker_active_kb(nid):
     return InlineKeyboardBuilder().button(text="📉 Слет", callback_data=f"w_drop_{nid}").as_markup()
 
 # ==========================================
-# БАЗОВЫЕ КОМАНДЫ
+# БАЗОВЫЕ КОМАНДЫ + НАВИГАЦИЯ (FIXED)
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
@@ -166,7 +160,9 @@ async def cmd_start(m: Message, state: FSMContext):
     async with get_db() as db:
         res = await (await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))).fetchone()
         if not res:
-            await db.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (uid, m.from_user.username, m.from_user.first_name))
+            # Регистрируем нового
+            await db.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", 
+                             (uid, m.from_user.username, m.from_user.first_name))
             await db.commit()
             if ADMIN_ID:
                 try: 
@@ -182,8 +178,17 @@ async def cmd_start(m: Message, state: FSMContext):
             return await m.answer("🔒 Доступ ограничен. Ждите одобрения администратора.")
         
         if res['is_banned']: return await m.answer("🚫 Вы заблокированы.")
-        if res['is_approved']: await m.answer(f"👋 Привет, {m.from_user.first_name}!\n{SEP}", reply_markup=main_kb(uid))
-        else: await m.answer("⏳ Заявка на рассмотрении.")
+        if res['is_approved']: 
+            await m.answer(f"👋 Привет, {m.from_user.first_name}!\n{SEP}", reply_markup=main_kb(uid))
+        else: 
+            await m.answer("⏳ Заявка на рассмотрении.")
+
+# [FIX] ЕДИНЫЙ ХЕНДЛЕР ВОЗВРАТА (Решает проблему с кнопкой Назад)
+@router.callback_query(F.data == "back_main")
+async def nav_home(c: CallbackQuery, state: FSMContext):
+    await state.clear() # Критически важно сбросить стейт (waiting_numbers и др.)
+    await c.message.edit_text(f"👋 Привет, {c.from_user.first_name}!\n{SEP}", reply_markup=main_kb(c.from_user.id))
+    await c.answer()
 
 @router.message(Command("bindgroup"))
 async def cmd_bindgroup(m: Message, command: CommandObject):
@@ -233,12 +238,16 @@ async def cmd_num(m: Message, bot: Bot):
         conf = await (await db.execute("SELECT value FROM config WHERE key=?", (f"topic_{cid}_{tid}",))).fetchone()
         if not conf: return await m.reply("❌ Топик не настроен (/startwork)")
         
+        # Берем самый старый номер из очереди (FIFO)
         row = await (await db.execute("SELECT * FROM numbers WHERE status='queue' AND tariff_name=? ORDER BY id ASC LIMIT 1", (conf['value'],))).fetchone()
         if not row: return await m.reply("📭 Очередь пуста")
         
         await db.execute("UPDATE numbers SET status='work', worker_id=?, worker_chat_id=?, worker_thread_id=?, start_time=? WHERE id=?", 
                          (m.from_user.id, cid, tid, get_now(), row['id']))
-        await db.execute("UPDATE users SET last_afk_check=? WHERE user_id=?", (get_now(), row['user_id'])) # Reset AFK for user
+        # Сброс таймера AFK для юзера, так как его номер взяли
+        try:
+             await db.execute("UPDATE users SET last_afk_check=? WHERE user_id=?", (get_now(), row['user_id']))
+        except: pass
         await db.commit()
     
     msg = f"🚀 Взят номер\n{SEP}\n📱 {row['phone']}\n💰 {row['tariff_price']}\n"
@@ -290,7 +299,7 @@ async def cb_sel_tariff(c: CallbackQuery):
     async with get_db() as db: tariffs = await (await db.execute("SELECT * FROM tariffs")).fetchall()
     kb = InlineKeyboardBuilder()
     for t in tariffs: kb.button(text=f"{t['name']} | {t['price']}", callback_data=f"pick_{t['name']}")
-    kb.button(text="🔙", callback_data="back_main")
+    kb.button(text="🔙 Назад", callback_data="back_main")
     kb.adjust(1)
     await c.message.edit_text("📂 Выберите тариф:", reply_markup=kb.as_markup())
 
@@ -300,15 +309,24 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
     async with get_db() as db: t = await (await db.execute("SELECT * FROM tariffs WHERE name=?", (tn,))).fetchone()
     await state.update_data(tariff=tn, price=t['price'], work_time=t['work_time'])
     await state.set_state(UserState.waiting_numbers)
-    await c.message.edit_text(f"💎 Тариф: {tn}\n💰 Цена: {t['price']}\n⏰ Время: {t['work_time']}\n\n👇 Пришлите номера:", 
-                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="back_main")]]))
+    # Тут кнопка Назад важна, чтобы выйти из стейта
+    await c.message.edit_text(f"💎 Тариф: {tn}\n💰 Цена: {t['price']}\n⏰ Время: {t['work_time']}\n\n👇 Пришлите номера списком:", 
+                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="back_main")]]))
 
 @router.message(UserState.waiting_numbers)
 async def fsm_nums(m: Message, state: FSMContext):
     data = await state.get_data()
+    # Фильтруем ввод
     raw = re.split(r'[;,\n]', m.text)
-    valid = [clean_phone(x.strip()) for x in raw if clean_phone(x.strip())]
-    if not valid: return await m.reply("❌ Нет валидных номеров")
+    valid = []
+    for x in raw:
+        cp = clean_phone(x.strip())
+        if cp: valid.append(cp)
+    
+    if not valid: 
+        # Если юзер вводит код, он скорее всего не пройдет clean_phone (если это 4-6 цифр), 
+        # поэтому код не попадет в БД и не уйдет в топик.
+        return await m.reply("❌ Нет валидных номеров (формат: 79xxxxxxxxx)")
     
     async with get_db() as db:
         for ph in valid:
@@ -320,7 +338,7 @@ async def fsm_nums(m: Message, state: FSMContext):
     await m.answer(f"✅ Принято {len(valid)} номеров!", reply_markup=main_kb(m.from_user.id))
 
 # ==========================================
-# АДМИН ПАНЕЛЬ + ОТЧЕТЫ + ОБРАБОТКА ПРИНЯТИЯ (FIXED)
+# АДМИН ПАНЕЛЬ + ОТЧЕТЫ
 # ==========================================
 @router.callback_query(F.data == "admin_main")
 async def cb_adm(c: CallbackQuery):
@@ -333,12 +351,10 @@ async def cb_adm(c: CallbackQuery):
     kb.adjust(1)
     await c.message.edit_text("⚡ Админ панель", reply_markup=kb.as_markup())
 
-# --- (FIXED) ОБРАБОТЧИК КНОПОК ПРИНЯТЬ/БАН ---
 @router.callback_query(F.data.startswith("acc_"))
 async def cb_acc_decision(c: CallbackQuery, bot: Bot):
     if c.from_user.id != ADMIN_ID: return await c.answer("🚫")
     
-    # acc_ok_12345
     parts = c.data.split("_")
     action = parts[1] # ok или no
     target_uid = int(parts[2])
@@ -354,9 +370,7 @@ async def cb_acc_decision(c: CallbackQuery, bot: Bot):
             msg_user = "🚫 Вам отказано в доступе."
         await db.commit()
     
-    # Обновляем сообщение у админа
     await c.message.edit_text(msg_adm)
-    # Уведомляем юзера
     try: await bot.send_message(target_uid, msg_user)
     except: pass
     await c.answer()
@@ -366,16 +380,15 @@ async def cb_acc_decision(c: CallbackQuery, bot: Bot):
 async def cb_adm_reports(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
     
-    # 1. Генерируем кнопки с датами (Сегодня + 6 дней назад)
     kb = InlineKeyboardBuilder()
     now = datetime.now()
     for i in range(7):
         d = now - timedelta(days=i)
-        d_str = d.strftime("%Y-%m-%d") # Формат 2026-01-15
+        d_str = d.strftime("%Y-%m-%d")
         kb.button(text=d_str, callback_data=f"rep_date_{d_str}")
     
     kb.button(text="🔙 Отмена", callback_data="admin_main")
-    kb.adjust(2) # По 2 в ряд
+    kb.adjust(2)
     await c.message.edit_text("📅 Выберите дату отчета:", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data.startswith("rep_date_"))
@@ -383,23 +396,21 @@ async def cb_rep_select_hour(c: CallbackQuery, state: FSMContext):
     date_str = c.data.split("_")[2]
     await state.update_data(rep_date=date_str)
     
-    # 2. Генерируем кнопки с часами (00 - 23)
     kb = InlineKeyboardBuilder()
     for h in range(24):
         h_str = f"{h:02d}"
         kb.button(text=f"{h_str}:00", callback_data=f"rep_hour_{h_str}")
     
     kb.button(text="🔙 Назад", callback_data="adm_reports")
-    kb.adjust(4) # По 4 в ряд
+    kb.adjust(4)
     await c.message.edit_text(f"📅 Дата: {date_str}\n🕒 Выберите ЧАС:", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data.startswith("rep_hour_"))
 async def cb_rep_generate(c: CallbackQuery, state: FSMContext):
     hour_str = c.data.split("_")[2]
     data = await state.get_data()
-    date_str = data['rep_date'] # 2026-01-15
+    date_str = data['rep_date']
     
-    # Формируем диапазон времени
     start_dt_str = f"{date_str}T{hour_str}:00:00"
     end_dt_str = f"{date_str}T{hour_str}:59:59"
     
@@ -414,7 +425,6 @@ async def cb_rep_generate(c: CallbackQuery, state: FSMContext):
     if not rows:
         return await c.answer("📂 За этот час нет данных", show_alert=True)
         
-    # Генерируем CSV
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(['ID', 'User', 'Phone', 'Status', 'Tariff', 'Created', 'Start', 'End'])
@@ -464,7 +474,8 @@ async def cb_stop_g(c: CallbackQuery, bot: Bot):
 async def cb_cast(c: CallbackQuery, state: FSMContext):
     if c.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.waiting_broadcast)
-    await c.message.edit_text("📢 Пришлите сообщение для рассылки (текст/фото):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="admin_main")]]))
+    await c.message.edit_text("📢 Пришлите сообщение для рассылки (текст/фото):", 
+                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="admin_main")]]))
 
 @router.message(AdminState.waiting_broadcast)
 async def fsm_cast(m: Message, state: FSMContext):
@@ -543,6 +554,10 @@ async def handle_user_msg(m: Message, bot: Bot):
     if m.text and m.text.startswith('/'): return
     if m.from_user.id == ADMIN_ID: return
     
+    # Этот хендлер срабатывает ТОЛЬКО если FSM пустой (нет стейта waiting_numbers)
+    # Поэтому конфликты с добавлением номеров исключены (если юзер не забаговал стейт, 
+    # а мы его теперь чистим кнопкой Назад)
+    
     async with get_db() as db:
         row = await (await db.execute("SELECT * FROM numbers WHERE user_id=? AND status IN ('work','active')", (m.from_user.id,))).fetchone()
     
@@ -603,14 +618,19 @@ async def monitor(bot: Bot):
                             try: await bot.send_message(r['user_id'], "❌ Номер удален из очереди (нет активности)")
                             except: pass
                     else:
-                        la = datetime.fromisoformat(las)
-                        if (now - la).total_seconds() / 60 >= AFK_CHECK_MINUTES:
-                            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👋 Я тут!", callback_data=f"afk_ok_{r['id']}")]]).as_markup()
-                            try:
-                                await bot.send_message(r['user_id'], f"⚠️ Проверка активности!\n{SEP}\nНажмите кнопку:", reply_markup=kb)
-                                await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (f"PENDING_{get_now()}", r['id']))
-                            except:
-                                await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],)) # Юзер заблочил бота
+                        try:
+                            la = datetime.fromisoformat(las)
+                            if (now - la).total_seconds() / 60 >= AFK_CHECK_MINUTES:
+                                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👋 Я тут!", callback_data=f"afk_ok_{r['id']}")]]).as_markup()
+                                try:
+                                    await bot.send_message(r['user_id'], f"⚠️ Проверка активности!\n{SEP}\nНажмите кнопку:", reply_markup=kb)
+                                    await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (f"PENDING_{get_now()}", r['id']))
+                                except:
+                                    await db.execute("DELETE FROM numbers WHERE id=?", (r['id'],)) # Юзер заблочил бота
+                        except Exception as e:
+                            # Если дата кривая или None - обновляем на текущую, чтобы не циклить ошибку
+                            await db.execute("UPDATE numbers SET last_ping=? WHERE id=?", (get_now(), r['id']))
+                
                 await db.commit()
         except Exception as e:
             logger.error(f"Monitor error: {e}")
@@ -621,12 +641,21 @@ async def monitor(bot: Bot):
 # ==========================================
 async def main():
     await init_db()
+    
+    # Используем Redis если переменная задана, иначе MemoryStorage (Bothost safe)
+    if os.getenv("REDIS_URL"):
+        from aiogram.fsm.storage.redis import RedisStorage
+        storage = RedisStorage.from_url(os.getenv("REDIS_URL"))
+    else:
+        storage = MemoryStorage()
+
     bot = Bot(token=TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=storage)
     dp.include_router(router)
+    
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 BOT MEGA FINAL v30.1 STARTED")
+    logger.info("🚀 FAST TEAM BOT v30.2 STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
