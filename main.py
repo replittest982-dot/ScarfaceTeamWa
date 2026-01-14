@@ -27,9 +27,9 @@ except ImportError:
 # ==========================================
 # КОНФИГУРАЦИЯ
 # ==========================================
-TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = "bot_v32_final.db" # Новая БД для поддержки Холда
+DB_NAME = "fast_team_v33.db" # Новое имя базы для чистого старта
 
 # Таймеры (минуты)
 AFK_CHECK_MINUTES = 8
@@ -55,7 +55,7 @@ async def get_db():
 
 async def init_db():
     async with get_db() as db:
-        # Users
+        # Юзеры
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
@@ -63,7 +63,7 @@ async def init_db():
                 reg_date TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Numbers (Added tariff_hold)
+        # Номера (С ХОЛДОМ)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS numbers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT,
@@ -74,41 +74,38 @@ async def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Tariffs (Added hold_time)
+        # Тарифы (С ХОЛДОМ)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tariffs (
                 name TEXT PRIMARY KEY, price TEXT, hold_time TEXT, work_time TEXT
             )
         """)
-        # Groups
+        # Группы и Конфиг
         await db.execute("CREATE TABLE IF NOT EXISTS groups (group_num INTEGER PRIMARY KEY, chat_id INTEGER, title TEXT)")
-        # Config
         await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
         
-        # Defaults
+        # Дефолт (если нет)
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('WhatsApp', '50₽', '20 мин', '10:00-22:00 МСК')")
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '1 час', '24/7')")
         
         await db.commit()
-    logger.info("✅ Database v32 initialized")
+    logger.info("✅ Database v33 initialized")
 
 # ==========================================
 # УТИЛИТЫ
 # ==========================================
 def clean_phone(phone):
-    # Очистка от мусора
+    if not phone: return None
     clean = re.sub(r'[^\d]', '', str(phone))
     
-    # Авто-чекер длины (защита от коротких/длинных)
+    # Авто-чекер длины
     if len(clean) < 10 or len(clean) > 15:
         return None
 
-    # Форматирование под СНГ (7/8)
     if clean.startswith('77') and len(clean) == 11: return '+' + clean
     if clean.startswith('8') and len(clean) == 11: clean = '7' + clean[1:]
     elif len(clean) == 10: clean = '7' + clean
     
-    # Проверка на валидность (только цифры)
     return '+' + clean if clean.isdigit() else None
 
 def mask_phone(phone, user_id):
@@ -144,11 +141,9 @@ class UserState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_broadcast = State()
-    # Редактирование тарифа
     edit_price = State()
     edit_hold = State()
     edit_time = State()
-    # Поддержка и отчеты
     help_reply = State()
     report_hours = State()
 
@@ -203,7 +198,7 @@ async def cmd_start(m: Message, state: FSMContext):
                         InlineKeyboardButton(text="✅ Принять", callback_data=f"acc_ok_{uid}"),
                         InlineKeyboardButton(text="🚫 Бан", callback_data=f"acc_no_{uid}")
                     ]])
-                    await m.bot.send_message(ADMIN_ID, f"👤 Запрос доступа: {uid} (@{m.from_user.username})", reply_markup=kb)
+                    await m.bot.send_message(ADMIN_ID, f"СУКА БЛЯЬ 👤 Запрос доступа: {uid} (@{m.from_user.username})", reply_markup=kb)
                 except: pass
             return await m.answer("🔒 Доступ ограничен. Ожидайте одобрения.")
         
@@ -215,6 +210,7 @@ async def cmd_start(m: Message, state: FSMContext):
 async def cb_back(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.edit_text(f"👋 Главное меню\n{SEP}", reply_markup=main_kb(c.from_user.id))
+    await c.answer()
 
 # ==========================================
 # PROFILE & QUEUE
@@ -241,26 +237,27 @@ async def cb_profile(c: CallbackQuery):
         reply_markup=kb.as_markup(),
         parse_mode="HTML"
     )
+    await c.answer()
 
 @router.callback_query(F.data == "my_queue")
 async def cb_my_queue(c: CallbackQuery):
     uid = c.from_user.id
     async with get_db() as db:
-        # Получаем все номера юзера в очереди, отсортированные по ID (кто раньше загрузил)
+        # Получаем все номера юзера в очереди, отсортированные по ID
         my_rows = await (await db.execute("SELECT id, phone, tariff_name FROM numbers WHERE user_id=? AND status='queue' ORDER BY id ASC", (uid,))).fetchall()
         
         if not my_rows:
             return await c.answer("📭 Ваша очередь пуста", show_alert=True)
             
-        # Теперь нам нужно узнать глобальную позицию для каждого номера
         txt = f"🔢 <b>ВАША ОЧЕРЕДЬ</b>\n{SEP}\n"
         for row in my_rows:
-            # Считаем сколько людей ПЕРЕД этим номером глобально
-            pos = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id < ?", (row['id'],))).fetchone())[0] + 1
-            txt += f"📱 {mask_phone(row['phone'], uid)} - <b>{pos}#</b>\n"
+            # Считаем глобальную позицию
+            pos = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id <= ?", (row['id'],))).fetchone())[0]
+            txt += f"📱 {mask_phone(row['phone'], uid)} — <b>{pos}#</b>\n"
 
     kb = InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="profile")
     await c.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await c.answer()
 
 # ==========================================
 # UPLOAD NUMBERS (ОЧЕРЕДЬ + ПОЗИЦИЯ)
@@ -273,12 +270,18 @@ async def cb_sel_tariff(c: CallbackQuery):
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
     await c.message.edit_text(f"📂 Выберите тариф\n{SEP}", reply_markup=kb.as_markup())
+    await c.answer()
 
 @router.callback_query(F.data.startswith("pick_"))
 async def cb_pick(c: CallbackQuery, state: FSMContext):
     tn = c.data.split("_")[1]
     async with get_db() as db: t = await (await db.execute("SELECT * FROM tariffs WHERE name=?", (tn,))).fetchone()
     
+    # Если тариф удалили или ошибка БД
+    if not t:
+        await c.answer("❌ Ошибка тарифа", show_alert=True)
+        return
+
     await state.update_data(tariff=tn, price=t['price'], hold=t['hold_time'], work_time=t['work_time'])
     await state.set_state(UserState.waiting_numbers)
     
@@ -291,10 +294,17 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
         f"📱 Отправьте номера списком:",
         reply_markup=kb.as_markup()
     )
+    await c.answer()
 
 @router.message(UserState.waiting_numbers)
 async def fsm_nums(m: Message, state: FSMContext):
     data = await state.get_data()
+    # Защита от сброса стейта
+    if not data:
+        await state.clear()
+        await m.answer("⚠️ Ошибка состояния. Попробуйте снова.")
+        return
+
     raw = re.split(r'[;,\n]', m.text)
     
     valid = []
@@ -306,23 +316,18 @@ async def fsm_nums(m: Message, state: FSMContext):
         elif x.strip(): invalid_count += 1
     
     if not valid:
-        return await m.reply("❌ Нет валидных номеров.\nПроверьте длину и формат (79xxxxxxxxx).")
+        return await m.reply("❌ Нет валидных номеров.\nПроверьте длину (10-15 цифр) и формат.")
     
     report = f"✅ <b>Принято в очередь: {len(valid)}</b>\n{SEP}\n"
     
     async with get_db() as db:
         for ph in valid:
-            # Вставляем
             cursor = await db.execute(
                 "INSERT INTO numbers (user_id, phone, tariff_name, tariff_price, tariff_hold, work_time, last_ping) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (m.from_user.id, ph, data['tariff'], data['price'], data['hold'], data['work_time'], get_now())
             )
             nid = cursor.lastrowid
-            
-            # Считаем позицию (глобальную)
             pos = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id <= ?", (nid,))).fetchone())[0]
-            
-            # Добавляем в отчет
             report += f"📱 {ph} — <b>{pos}#</b>\n"
             
         await db.commit()
@@ -363,7 +368,7 @@ async def cmd_num(m: Message, bot: Bot):
     await m.answer(msg, reply_markup=kb, parse_mode="HTML")
     
     # Msg to User
-    try: await bot.send_message(row['user_id'], f"⚡ <b>Ваш номер взяли!</b>\n📱 {mask_phone(row['phone'], 0)}\nОжидайте код.", parse_mode="HTML")
+    try: await bot.send_message(row['user_id'], f"⚡ <b>Номер в работе!</b>\n📱 {mask_phone(row['phone'], 0)}\nОжидайте код.", parse_mode="HTML")
     except: pass
 
 @router.message(Command("code"))
@@ -381,7 +386,7 @@ async def cmd_code(m: Message, command: CommandObject, bot: Bot):
         await db.commit()
     
     try:
-        await bot.send_message(row['user_id'], f"🔔 <b>Офис запросил код</b>\nОтветьте сообщением ниже.", parse_mode="HTML")
+        await bot.send_message(row['user_id'], f"🔔 <b>Офис запросил номер</b>\nОтветьте ниже сообщением чтобы дать код.", parse_mode="HTML")
         await m.reply("✅ Запрос отправлен")
     except: await m.reply("❌ Не доставлено")
 
@@ -403,7 +408,7 @@ async def cb_worker_actions(c: CallbackQuery, bot: Bot):
         if act == "act":
             await db.execute("UPDATE numbers SET status='active' WHERE id=?", (nid,))
             adm_msg = "✅ Номер встал"
-            user_msg = "✅ Номер встал!"
+            user_msg = "✅ Номер встал и все" # Твой текст
             kb = worker_active_kb(nid)
             
         elif act == "skip":
@@ -420,7 +425,7 @@ async def cb_worker_actions(c: CallbackQuery, bot: Bot):
             await db.execute("UPDATE numbers SET status='finished', end_time=? WHERE id=?", (get_now(), nid))
             dur = calc_duration(row['start_time'], get_now())
             adm_msg = f"📉 Слет ({dur})"
-            user_msg = f"📉 Ваш номер слетел\nВремя: {dur}"
+            user_msg = f"📉 Ваш номер слетел\nВремя работы: {dur}"
             
         await db.commit()
     
@@ -430,7 +435,7 @@ async def cb_worker_actions(c: CallbackQuery, bot: Bot):
     await c.answer()
 
 # ==========================================
-# ADMIN PANEL (EDIT TARIFFS FIXED)
+# ADMIN PANEL
 # ==========================================
 @router.callback_query(F.data == "admin_main")
 async def cb_adm(c: CallbackQuery):
@@ -442,6 +447,7 @@ async def cb_adm(c: CallbackQuery):
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
     await c.message.edit_text("⚡ Админ панель", reply_markup=kb.as_markup())
+    await c.answer()
 
 @router.callback_query(F.data == "adm_tariffs")
 async def cb_adm_t(c: CallbackQuery):
@@ -452,8 +458,9 @@ async def cb_adm_t(c: CallbackQuery):
     kb.button(text="🔙 Назад", callback_data="admin_main")
     kb.adjust(1)
     await c.message.edit_text("🛠 Выберите тариф для редактирования:", reply_markup=kb.as_markup())
+    await c.answer()
 
-# --- ЦЕПОЧКА РЕДАКТИРОВАНИЯ (Price -> Hold -> Time) ---
+# --- EDIT CHAIN ---
 @router.callback_query(F.data.startswith("ed_"))
 async def cb_ed_start(c: CallbackQuery, state: FSMContext):
     target = c.data.split("_")[1]
@@ -508,6 +515,41 @@ async def cb_all_queue(c: CallbackQuery):
         
     kb = InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="admin_main")
     await c.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await c.answer()
+
+# --- REPORTS ---
+@router.callback_query(F.data == "adm_reports")
+async def cb_adm_reports(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.report_hours)
+    kb = InlineKeyboardBuilder().button(text="🔙", callback_data="admin_main")
+    await c.message.edit_text("📊 <b>Генерация отчета</b>\n\nВведите период в часах (например: 24, 48, 120):", reply_markup=kb.as_markup(), parse_mode="HTML")
+    await c.answer()
+
+@router.message(AdminState.report_hours)
+async def fsm_rep_gen(m: Message, state: FSMContext):
+    try: hours = int(m.text)
+    except: return await m.reply("❌ Введите число.")
+    if hours > 120: hours = 120
+    
+    dt_start = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    
+    async with get_db() as db:
+        rows = await (await db.execute("SELECT * FROM numbers WHERE created_at >= ? ORDER BY id DESC", (dt_start,))).fetchall()
+        
+    if not rows:
+        await state.clear()
+        return await m.answer("📂 Пусто.")
+    
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(['ID', 'User', 'Phone', 'Status', 'Tariff', 'Created', 'Start', 'End'])
+    for r in rows:
+        w.writerow([r['id'], r['user_id'], r['phone'], r['status'], r['tariff_name'], format_time(r['created_at']), format_time(r['start_time']), format_time(r['end_time'])])
+    out.seek(0)
+    
+    await m.answer_document(BufferedInputFile(out.getvalue().encode(), filename=f"report_{hours}h.csv"), caption=f"📊 Отчет {hours}ч")
+    await state.clear()
 
 # ==========================================
 # HELP & SUPPORT
@@ -515,19 +557,26 @@ async def cb_all_queue(c: CallbackQuery):
 @router.callback_query(F.data == "guide")
 async def cb_guide(c: CallbackQuery):
     await c.message.edit_text(
-        f"📲 <b>Гайд</b>\n{SEP}\n"
-        f"1. Выберите тариф.\n"
-        f"2. Загрузите номера (валидатор проверит длину 10-15 цифр).\n"
-        f"3. Получите ID позиции в очереди (например 5#).\n"
-        f"4. Ждите выплаты после холда.",
-        reply_markup=back_kb(), parse_mode="HTML"
+        f"✅ Чат привязан!\n\n"
+        f"👨‍💻 Гайд по использованию:\n\n"
+        f"1️⃣ Пиши /num -> Получишь номер.\n\n"
+        f"2️⃣ Вбей номер в WhatsApp Web.\n\n"
+        f"3️⃣ Если просят QR: Сфоткай QR с экрана.\n"
+        f"   Скинь фото сюда и подпиши: /sms +77... Сканируй\n\n"
+        f"4️⃣ Если просят Код (по номеру): Сфоткай код с экрана.\n"
+        f"   Скинь фото сюда и подпиши: /sms +77... Вводи этот код\n\n"
+        f"5️⃣ Когда зашел -> жми ✅ Встал.\n"
+        f"6️⃣ Когда номер слетел -> жми 📉 Слет.",
+        reply_markup=back_kb()
     )
+    await c.answer()
 
 @router.callback_query(F.data == "ask_help")
 async def cb_ask(c: CallbackQuery, state: FSMContext):
     await state.set_state(UserState.waiting_help)
     kb = InlineKeyboardBuilder().button(text="🔙 Отмена", callback_data="back_main")
     await c.message.edit_text("🆘 Напишите ваш вопрос:", reply_markup=kb.as_markup())
+    await c.answer()
 
 @router.message(UserState.waiting_help)
 async def fsm_help(m: Message, state: FSMContext, bot: Bot):
@@ -629,7 +678,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 BOT v32.0 FINAL STARTED")
+    logger.info("🚀 BOT v33.0 FIXED STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
