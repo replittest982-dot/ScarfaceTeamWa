@@ -83,7 +83,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('WhatsApp','50₽','10:00-22:00 МСК')")
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('MAX','10$','24/7')")
         await db.commit()
-    logger.info("✅ Database initialized (Mega V30.0)")
+    logger.info("✅ Database initialized (Mega V30.1)")
 
 # ==========================================
 # УТИЛИТЫ
@@ -169,10 +169,17 @@ async def cmd_start(m: Message, state: FSMContext):
             await db.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (uid, m.from_user.username, m.from_user.first_name))
             await db.commit()
             if ADMIN_ID:
-                try: await m.bot.send_message(ADMIN_ID, f"👤 Новый: {uid} (@{m.from_user.username})", 
-                                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Принять", callback_data=f"acc_ok_{uid}"), InlineKeyboardButton(text="🚫 Бан", callback_data=f"acc_no_{uid}")]]))
+                try: 
+                    await m.bot.send_message(
+                        ADMIN_ID, 
+                        f"👤 Новый юзер: {uid} (@{m.from_user.username})", 
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="✅ Принять", callback_data=f"acc_ok_{uid}"), 
+                            InlineKeyboardButton(text="🚫 Бан", callback_data=f"acc_no_{uid}")
+                        ]])
+                    )
                 except: pass
-            return await m.answer("🔒 Доступ ограничен. Ждите одобрения.")
+            return await m.answer("🔒 Доступ ограничен. Ждите одобрения администратора.")
         
         if res['is_banned']: return await m.answer("🚫 Вы заблокированы.")
         if res['is_approved']: await m.answer(f"👋 Привет, {m.from_user.first_name}!\n{SEP}", reply_markup=main_kb(uid))
@@ -313,7 +320,7 @@ async def fsm_nums(m: Message, state: FSMContext):
     await m.answer(f"✅ Принято {len(valid)} номеров!", reply_markup=main_kb(m.from_user.id))
 
 # ==========================================
-# АДМИН ПАНЕЛЬ + НОВЫЕ ОТЧЕТЫ
+# АДМИН ПАНЕЛЬ + ОТЧЕТЫ + ОБРАБОТКА ПРИНЯТИЯ (FIXED)
 # ==========================================
 @router.callback_query(F.data == "admin_main")
 async def cb_adm(c: CallbackQuery):
@@ -325,6 +332,34 @@ async def cb_adm(c: CallbackQuery):
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
     await c.message.edit_text("⚡ Админ панель", reply_markup=kb.as_markup())
+
+# --- (FIXED) ОБРАБОТЧИК КНОПОК ПРИНЯТЬ/БАН ---
+@router.callback_query(F.data.startswith("acc_"))
+async def cb_acc_decision(c: CallbackQuery, bot: Bot):
+    if c.from_user.id != ADMIN_ID: return await c.answer("🚫")
+    
+    # acc_ok_12345
+    parts = c.data.split("_")
+    action = parts[1] # ok или no
+    target_uid = int(parts[2])
+    
+    async with get_db() as db:
+        if action == "ok":
+            await db.execute("UPDATE users SET is_approved=1, is_banned=0 WHERE user_id=?", (target_uid,))
+            msg_adm = f"✅ Пользователь {target_uid} принят."
+            msg_user = "✅ Вам одобрен доступ! Жмите /start"
+        else:
+            await db.execute("UPDATE users SET is_banned=1, is_approved=0 WHERE user_id=?", (target_uid,))
+            msg_adm = f"🚫 Пользователь {target_uid} забанен."
+            msg_user = "🚫 Вам отказано в доступе."
+        await db.commit()
+    
+    # Обновляем сообщение у админа
+    await c.message.edit_text(msg_adm)
+    # Уведомляем юзера
+    try: await bot.send_message(target_uid, msg_user)
+    except: pass
+    await c.answer()
 
 # --- ЛОГИКА ОТЧЕТОВ ---
 @router.callback_query(F.data == "adm_reports")
@@ -367,10 +402,6 @@ async def cb_rep_generate(c: CallbackQuery, state: FSMContext):
     # Формируем диапазон времени
     start_dt_str = f"{date_str}T{hour_str}:00:00"
     end_dt_str = f"{date_str}T{hour_str}:59:59"
-    
-    # Учитываем что в базе UTC (isoformat), а запрос может быть локальным
-    # Для упрощения ищем по строковому вхождению или простому сравнению строк ISO
-    # (ISO формат отлично сортируется и сравнивается как строки)
     
     async with get_db() as db:
         rows = await (await db.execute("""
@@ -595,7 +626,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 BOT MEGA FINAL v30.0 STARTED")
+    logger.info("🚀 BOT MEGA FINAL v30.1 STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
