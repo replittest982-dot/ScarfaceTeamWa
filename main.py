@@ -29,11 +29,11 @@ except ImportError:
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = "fast_team_v27.db"
+DB_NAME = "fast_team_v28.db"
 
 # Таймеры
-AFK_CHECK_MINUTES = 8  # Через сколько спросить "Ты тут?"
-AFK_KICK_MINUTES = 3   # Сколько ждать ответа перед киком
+AFK_CHECK_MINUTES = 8  # Через сколько минут спрашивать "Ты тут?"
+AFK_KICK_MINUTES = 3   # Сколько ждать ответа на кнопку
 SEP = "━━━━━━━━━━━━━━━━━━━━"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -76,7 +76,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('WhatsApp','50₽','10:00-22:00 МСК')")
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES('MAX','10$','24/7')")
         await db.commit()
-    logger.info("✅ Database initialized (v27.0 Ultimate)")
+    logger.info("✅ Database initialized (v28.0 Fixed)")
 
 # ==========================================
 # 3. УТИЛИТЫ
@@ -100,14 +100,6 @@ def format_report_dt(iso_str):
     try: return (datetime.fromisoformat(iso_str) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
     except: return iso_str
 
-def calc_duration(start_iso, end_iso):
-    try:
-        s = datetime.fromisoformat(start_iso)
-        e = datetime.fromisoformat(end_iso)
-        mins = int((e - s).total_seconds() / 60)
-        return f"{mins // 60}ч {mins % 60}мин" if mins >= 60 else f"{mins} мин"
-    except: return "0 мин"
-
 # FSM
 class UserState(StatesGroup):
     waiting_number = State()
@@ -117,10 +109,60 @@ class AdminState(StatesGroup):
     replying_to = State()
 
 # ==========================================
-# 4. ЮЗЕР -> ОФИС (BRIDGE)
+# 4. ОБНОВЛЕННЫЙ /START (FIX)
 # ==========================================
+def main_kb(user_id):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Сдать номер", callback_data="sel_tariff")
+    kb.button(text="👤 Профиль", callback_data="profile")
+    kb.button(text="🆘 Помощь", callback_data="ask_help")
+    if user_id == ADMIN_ID: kb.button(text="⚙️ Админ", callback_data="admin_main")
+    kb.adjust(1, 2, 1)
+    return kb.as_markup()
 
-# Единый обработчик для ТЕКСТА и ФОТО от юзера в ЛС
+@router.message(CommandStart())
+async def cmd_start(m: Message, state: FSMContext):
+    await state.clear()
+    uid = m.from_user.id
+    username = m.from_user.username or "NoUsername"
+    first_name = m.from_user.first_name or "User"
+
+    async with get_db() as db:
+        # 1. Проверяем, есть ли юзер в базе
+        user = await (await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))).fetchone()
+
+        if not user:
+            # 2. Если нет - создаем
+            await db.execute(
+                "INSERT INTO users (user_id, username, first_name, last_afk_check) VALUES (?, ?, ?, ?)", 
+                (uid, username, first_name, get_now())
+            )
+            await db.commit()
+            
+            # Уведомляем админа
+            if ADMIN_ID:
+                try:
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="✅ Принять", callback_data=f"acc_ok_{uid}"), 
+                        InlineKeyboardButton(text="🚫 Бан", callback_data=f"acc_no_{uid}")
+                    ]])
+                    await m.bot.send_message(ADMIN_ID, f"👤 <b>Новый запрос:</b>\nID: {uid}\n@{username}", reply_markup=kb, parse_mode="HTML")
+                except: pass
+            
+            return await m.answer("🔒 <b>Доступ ограничен.</b>\nОжидайте одобрения администратора.", parse_mode="HTML")
+
+        # 3. Если есть - проверяем статус
+        if user['is_banned']:
+            return await m.answer("🚫 Вы заблокированы.")
+        
+        if user['is_approved']:
+            return await m.answer(f"👋 Привет, <b>{first_name}</b>!", reply_markup=main_kb(uid), parse_mode="HTML")
+        else:
+            return await m.answer("⏳ Ваша заявка все еще на рассмотрении.")
+
+# ==========================================
+# 5. ЮЗЕР -> ОФИС (BRIDGE)
+# ==========================================
 @router.message(F.chat.type == "private")
 async def handle_user_message(m: Message, bot: Bot, state: FSMContext):
     user_id = m.from_user.id
@@ -142,7 +184,6 @@ async def handle_user_message(m: Message, bot: Bot, state: FSMContext):
             p_row = await (await db.execute("SELECT price FROM tariffs WHERE name=?", (tariff,))).fetchone()
             price = p_row['price'] if p_row else "0"
             
-            # Вставляем номер и обновляем таймер активности
             await db.execute("INSERT INTO numbers (user_id, phone, tariff_name, tariff_price, created_at) VALUES (?, ?, ?, ?, ?)", 
                              (user_id, clean, tariff, price, get_now()))
             await db.execute("UPDATE users SET last_afk_check=? WHERE user_id=?", (get_now(), user_id))
@@ -152,7 +193,7 @@ async def handle_user_message(m: Message, bot: Bot, state: FSMContext):
         await m.answer(f"✅ Номер {clean} добавлен в очередь!\nТариф: {tariff}")
         return
 
-    # --- ПОДДЕРЖКА (ВОПРОС) ---
+    # --- ПОДДЕРЖКА ---
     if st == UserState.waiting_question:
         if not ADMIN_ID: return
         try:
@@ -165,11 +206,7 @@ async def handle_user_message(m: Message, bot: Bot, state: FSMContext):
 
     # --- ПЕРЕСЫЛКА В ТОПИК ---
     async with get_db() as db:
-        row = await (await db.execute("""
-            SELECT * FROM numbers 
-            WHERE user_id=? AND status IN ('work', 'active') 
-            ORDER BY id DESC LIMIT 1
-        """, (user_id,))).fetchone()
+        row = await (await db.execute("SELECT * FROM numbers WHERE user_id=? AND status IN ('work', 'active') ORDER BY id DESC LIMIT 1", (user_id,))).fetchone()
     
     if not row: return 
     if not row['worker_chat_id']: return await m.reply("⏳ Ожидайте специалиста.")
@@ -180,7 +217,6 @@ async def handle_user_message(m: Message, bot: Bot, state: FSMContext):
 
     try:
         thread_id = int(row['worker_thread_id']) if row['worker_thread_id'] else None
-        
         if m.photo:
             await bot.send_photo(chat_id=row['worker_chat_id'], message_thread_id=thread_id, photo=m.photo[-1].file_id, caption=topic_msg, parse_mode="HTML")
         else:
@@ -192,15 +228,13 @@ async def handle_user_message(m: Message, bot: Bot, state: FSMContext):
         logger.error(f"Bridge Error: {e}")
 
 # ==========================================
-# 5. ОФИС -> ЮЗЕР (ФОТО/SMS)
+# 6. ОФИС -> ЮЗЕР
 # ==========================================
 @router.message(F.photo & F.caption)
 async def handle_worker_photo(m: Message, bot: Bot):
     if m.chat.type == "private": return 
 
-    # Парсинг /sms +7... текст
     match = re.search(r'(/sms|/code)\s+([+\d]+)\s*(.*)', m.caption, flags=re.DOTALL)
-    
     if match:
         raw_phone = match.group(2)
         text_for_user = match.group(3).strip()
@@ -222,7 +256,7 @@ async def handle_worker_photo(m: Message, bot: Bot):
             await m.reply(f"❌ Не доставлено: {e}")
 
 # ==========================================
-# 6. КОМАНДЫ ВОРКЕРА
+# 7. КОМАНДЫ ВОРКЕРА
 # ==========================================
 @router.message(Command("startwork"))
 async def cmd_startwork(m: Message):
@@ -272,7 +306,6 @@ async def cmd_num(m: Message, bot: Bot):
         kb.button(text="📉 Слет", callback_data=f"w_drop_{row['id']}")
         hint = f"Фото юзеру: `/sms {row['phone']} Текст` (прикрепи фото)"
         
-    # Добавил кнопку ошибки
     kb.button(text="❌ Ошибка", callback_data=f"w_err_{row['id']}")
     kb.adjust(2, 1)
     
@@ -296,66 +329,29 @@ async def cmd_code(m: Message, bot: Bot):
     except: await m.reply("❌ Не удалось доставить запрос.")
 
 # ==========================================
-# 7. МЕНЮ, ПРОФИЛЬ, CALLBACKS
+# 8. МЕНЮ И КНОПКИ
 # ==========================================
-def main_kb(user_id):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📥 Сдать номер", callback_data="sel_tariff")
-    kb.button(text="👤 Профиль", callback_data="profile")
-    kb.button(text="🆘 Помощь", callback_data="ask_help")
-    if user_id == ADMIN_ID: kb.button(text="⚙️ Админ", callback_data="admin_main")
-    kb.adjust(1, 2, 1)
-    return kb.as_markup()
-
-@router.message(CommandStart())
-async def cmd_start(m: Message, state: FSMContext):
-    await state.clear()
-    uid = m.from_user.id
-    async with get_db() as db:
-        res = await (await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))).fetchone()
-        if not res:
-            await db.execute("INSERT INTO users (user_id, username, first_name, last_afk_check) VALUES (?, ?, ?, ?)", (uid, m.from_user.username, m.from_user.first_name, get_now()))
-            await db.commit()
-            if ADMIN_ID:
-                try: await m.bot.send_message(ADMIN_ID, f"👤 Новый: {uid}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅", callback_data=f"acc_ok_{uid}"), InlineKeyboardButton(text="🚫", callback_data=f"acc_no_{uid}")]]))
-                except: pass
-            return await m.answer("🔒 Ждите одобрения.")
-        if res['is_approved']: await m.answer(f"👋 Привет!", reply_markup=main_kb(uid))
-        else: await m.answer("⏳ Заявка на рассмотрении.")
-
 @router.callback_query(F.data == "back_main")
 async def cb_back(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.edit_text("Главное меню", reply_markup=main_kb(c.from_user.id))
     await c.answer()
 
-# --- ПРОФИЛЬ (НОВОЕ) ---
 @router.callback_query(F.data == "profile")
 async def cb_profile(c: CallbackQuery):
     uid = c.from_user.id
     async with get_db() as db:
         total = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (uid,))).fetchone())[0]
         active = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=? AND status IN ('work','active')", (uid,))).fetchone())[0]
-    
-    await c.message.edit_text(
-        f"👤 <b>Профиль</b>\n{SEP}\n🆔 ID: {uid}\n📦 Всего сдано: {total}\n🔥 Активных: {active}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="back_main")]]),
-        parse_mode="HTML"
-    )
+    await c.message.edit_text(f"👤 <b>Профиль</b>\n{SEP}\n🆔 ID: {uid}\n📦 Всего сдано: {total}\n🔥 Активных: {active}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="back_main")]]), parse_mode="HTML")
     await c.answer()
 
-# --- ПОМОЩЬ (НОВОЕ) ---
 @router.callback_query(F.data == "ask_help")
 async def cb_help(c: CallbackQuery, state: FSMContext):
     await state.set_state(UserState.waiting_question)
-    await c.message.edit_text(
-        f"🆘 <b>Помощь</b>\n{SEP}\nНапишите ваш вопрос одним сообщением:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="back_main")]]),
-        parse_mode="HTML"
-    )
+    await c.message.edit_text(f"🆘 <b>Помощь</b>\n{SEP}\nНапишите ваш вопрос одним сообщением:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="back_main")]]), parse_mode="HTML")
     await c.answer()
 
-# --- СДАЧА НОМЕРА ---
 @router.callback_query(F.data == "sel_tariff")
 async def cb_sel(c: CallbackQuery):
     async with get_db() as db: rows = await (await db.execute("SELECT * FROM tariffs")).fetchall()
@@ -374,18 +370,15 @@ async def cb_add(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text(f"📞 Тариф: {tariff}\nПиши номер (+7...):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙", callback_data="back_main")]]))
     await c.answer()
 
-# --- КНОПКИ ВОРКЕРА (ОБНОВЛЕНО) ---
+# --- ВОРКЕР АКТИОНЫ ---
 @router.callback_query(F.data.startswith("w_"))
 async def cb_worker(c: CallbackQuery, bot: Bot):
     act, nid = c.data.split("_")[1], int(c.data.split("_")[2])
-    
     async with get_db() as db:
         row = await (await db.execute("SELECT * FROM numbers WHERE id=?", (nid,))).fetchone()
         if not row: return await c.answer("Не найдено")
-        if row['worker_id'] != c.from_user.id: return await c.answer("Не твой!", show_alert=True)
         
         st, msg, user_msg = "dead", "❌ Отмена", "❌ Ошибка"
-        
         if act == "suc": 
             st, msg, user_msg = "finished", "✅ Успех", "✅ Номер успешно проверен!"
         elif act == "drop": 
@@ -403,7 +396,9 @@ async def cb_worker(c: CallbackQuery, bot: Bot):
     except: pass
     await c.answer()
 
-# --- AFK OK BUTTON (НОВОЕ) ---
+# ==========================================
+# 9. ИСПРАВЛЕННЫЙ AFK FIX (ПОВТОРНОЕ НАЖАТИЕ)
+# ==========================================
 @router.callback_query(F.data.startswith("afk_ok_"))
 async def cb_afk_ok(c: CallbackQuery):
     uid = int(c.data.split("_")[2])
@@ -411,22 +406,25 @@ async def cb_afk_ok(c: CallbackQuery):
         return await c.answer("🚫 Не для вас!", show_alert=True)
     
     async with get_db() as db:
+        # ОБНОВЛЯЕМ время на ТЕКУЩЕЕ, чтобы сбросить проверку еще на 8 минут
         await db.execute("UPDATE users SET last_afk_check=? WHERE user_id=?", (get_now(), uid))
         await db.commit()
     
-    await c.message.delete()
-    await c.answer("✅ Вы в очереди!")
+    # Пытаемся удалить сообщение, чтобы кнопка не висела
+    try: await c.message.delete()
+    except: pass
+    
+    await c.answer("✅ Активность подтверждена!")
 
-# --- MONITORING (ОБНОВЛЕНО) ---
 async def monitor(bot: Bot):
-    logger.info("👀 Monitor started (Aggressive Mode)")
+    logger.info("👀 Monitor started (Cycle Fix)")
     while True:
         await asyncio.sleep(60)
         now = datetime.now(timezone.utc)
         
         try:
             async with get_db() as db:
-                # Берем уникальных юзеров у которых есть номера в очереди
+                # Ищем юзеров, у которых ЕСТЬ номера в очереди
                 users = await (await db.execute("""
                     SELECT DISTINCT u.user_id, u.last_afk_check 
                     FROM users u 
@@ -438,23 +436,25 @@ async def monitor(bot: Bot):
                     uid = u['user_id']
                     last = u['last_afk_check']
                     
-                    # Если last_afk_check пустой или прошло AFK_CHECK_MINUTES
-                    if not last or (not last.startswith("PENDING") and (now - datetime.fromisoformat(last)).total_seconds() / 60 > AFK_CHECK_MINUTES):
+                    # 1. Если просто прошло время (8 мин) и не висит PENDING
+                    if not last or (not str(last).startswith("PENDING") and (now - datetime.fromisoformat(last)).total_seconds() / 60 > AFK_CHECK_MINUTES):
                         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👋 Я тут!", callback_data=f"afk_ok_{uid}")]])
                         try:
                             await bot.send_message(uid, f"⚠️ <b>Проверка активности!</b>\n{SEP}\nНажми кнопку, иначе заявка удалится.", reply_markup=kb, parse_mode="HTML")
                             await db.execute("UPDATE users SET last_afk_check=? WHERE user_id=?", (f"PENDING_{get_now()}", uid))
                         except TelegramForbiddenError:
+                            # Юзер заблочил бота - кикаем
                             await db.execute("DELETE FROM numbers WHERE user_id=? AND status='queue'", (uid,))
                         except Exception as e:
                             logger.error(f"AFK Send Error: {e}")
                     
-                    # Если висит статус PENDING и время вышло
+                    # 2. Если уже висит PENDING (ждали нажатия)
                     elif str(last).startswith("PENDING_"):
                         pt = datetime.fromisoformat(last.split("_")[1])
+                        # Если прошло 3 минуты с момента вопроса, а юзер не нажал
                         if (now - pt).total_seconds() / 60 > AFK_KICK_MINUTES:
                             await db.execute("DELETE FROM numbers WHERE user_id=? AND status='queue'", (uid,))
-                            # Сбрасываем таймер, чтобы юзер мог заново подать потом без мгновенного кика
+                            # Сбрасываем, чтобы не зациклилось удаление
                             await db.execute("UPDATE users SET last_afk_check=? WHERE user_id=?", (get_now(), uid))
                             try: await bot.send_message(uid, "❌ Заявки удалены из-за неактивности.")
                             except: pass
@@ -482,7 +482,6 @@ async def cb_acc(c: CallbackQuery, bot: Bot):
     try: await bot.send_message(uid, "✅ Доступ!" if act=="ok" else "🚫 Бан")
     except: pass
 
-# --- START ---
 async def main():
     await init_db()
     bot = Bot(token=TOKEN)
@@ -490,7 +489,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 BOT v27.0 STARTED (Ultimate + Fixes)")
+    logger.info("🚀 BOT v28.0 STARTED (Fixes applied)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
