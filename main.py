@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = "fast_team_v33.db" # Новое имя базы для чистого старта
+DB_NAME = "bot_v34_clean.db" # Новая база для исправления ошибок кнопок
 
 # Таймеры (минуты)
 AFK_CHECK_MINUTES = 8
@@ -89,7 +89,7 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO tariffs VALUES ('MAX', '10$', '1 час', '24/7')")
         
         await db.commit()
-    logger.info("✅ Database v33 initialized")
+    logger.info("✅ Database v34 initialized")
 
 # ==========================================
 # УТИЛИТЫ
@@ -180,7 +180,7 @@ def back_kb():
     return InlineKeyboardBuilder().button(text="🔙 Меню", callback_data="back_main").as_markup()
 
 # ==========================================
-# START & AUTH
+# START & AUTH (ИСПРАВЛЕНО)
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
@@ -198,7 +198,8 @@ async def cmd_start(m: Message, state: FSMContext):
                         InlineKeyboardButton(text="✅ Принять", callback_data=f"acc_ok_{uid}"),
                         InlineKeyboardButton(text="🚫 Бан", callback_data=f"acc_no_{uid}")
                     ]])
-                    await m.bot.send_message(ADMIN_ID, f"СУКА БЛЯЬ 👤 Запрос доступа: {uid} (@{m.from_user.username})", reply_markup=kb)
+                    # Текст исправлен на нормальный
+                    await m.bot.send_message(ADMIN_ID, f"👤 Запрос доступа: {uid} (@{m.from_user.username})", reply_markup=kb)
                 except: pass
             return await m.answer("🔒 Доступ ограничен. Ожидайте одобрения.")
         
@@ -243,7 +244,6 @@ async def cb_profile(c: CallbackQuery):
 async def cb_my_queue(c: CallbackQuery):
     uid = c.from_user.id
     async with get_db() as db:
-        # Получаем все номера юзера в очереди, отсортированные по ID
         my_rows = await (await db.execute("SELECT id, phone, tariff_name FROM numbers WHERE user_id=? AND status='queue' ORDER BY id ASC", (uid,))).fetchall()
         
         if not my_rows:
@@ -251,7 +251,6 @@ async def cb_my_queue(c: CallbackQuery):
             
         txt = f"🔢 <b>ВАША ОЧЕРЕДЬ</b>\n{SEP}\n"
         for row in my_rows:
-            # Считаем глобальную позицию
             pos = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id <= ?", (row['id'],))).fetchone())[0]
             txt += f"📱 {mask_phone(row['phone'], uid)} — <b>{pos}#</b>\n"
 
@@ -260,7 +259,7 @@ async def cb_my_queue(c: CallbackQuery):
     await c.answer()
 
 # ==========================================
-# UPLOAD NUMBERS (ОЧЕРЕДЬ + ПОЗИЦИЯ)
+# UPLOAD NUMBERS
 # ==========================================
 @router.callback_query(F.data == "sel_tariff")
 async def cb_sel_tariff(c: CallbackQuery):
@@ -277,7 +276,6 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
     tn = c.data.split("_")[1]
     async with get_db() as db: t = await (await db.execute("SELECT * FROM tariffs WHERE name=?", (tn,))).fetchone()
     
-    # Если тариф удалили или ошибка БД
     if not t:
         await c.answer("❌ Ошибка тарифа", show_alert=True)
         return
@@ -299,14 +297,12 @@ async def cb_pick(c: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_numbers)
 async def fsm_nums(m: Message, state: FSMContext):
     data = await state.get_data()
-    # Защита от сброса стейта
     if not data:
         await state.clear()
         await m.answer("⚠️ Ошибка состояния. Попробуйте снова.")
         return
 
     raw = re.split(r'[;,\n]', m.text)
-    
     valid = []
     invalid_count = 0
     
@@ -408,7 +404,7 @@ async def cb_worker_actions(c: CallbackQuery, bot: Bot):
         if act == "act":
             await db.execute("UPDATE numbers SET status='active' WHERE id=?", (nid,))
             adm_msg = "✅ Номер встал"
-            user_msg = "✅ Номер встал и все" # Твой текст
+            user_msg = "✅ Номер встал и все" 
             kb = worker_active_kb(nid)
             
         elif act == "skip":
@@ -435,7 +431,7 @@ async def cb_worker_actions(c: CallbackQuery, bot: Bot):
     await c.answer()
 
 # ==========================================
-# ADMIN PANEL
+# ADMIN PANEL (ИСКЛЮЧИТЕЛЬНО РАБОЧИЕ КНОПКИ)
 # ==========================================
 @router.callback_query(F.data == "admin_main")
 async def cb_adm(c: CallbackQuery):
@@ -447,6 +443,30 @@ async def cb_adm(c: CallbackQuery):
     kb.button(text="🔙 Меню", callback_data="back_main")
     kb.adjust(1)
     await c.message.edit_text("⚡ Админ панель", reply_markup=kb.as_markup())
+    await c.answer()
+
+@router.callback_query(F.data.startswith("acc_"))
+async def cb_acc(c: CallbackQuery, bot: Bot):
+    if c.from_user.id != ADMIN_ID: return await c.answer("🚫")
+    
+    parts = c.data.split("_")
+    action = parts[1] # ok или no
+    target_uid = int(parts[2])
+    
+    async with get_db() as db:
+        if action == "ok":
+            await db.execute("UPDATE users SET is_approved=1, is_banned=0 WHERE user_id=?", (target_uid,))
+            msg_adm = f"✅ Пользователь {target_uid} принят."
+            msg_user = "✅ Вам одобрен доступ! Жмите /start"
+        else:
+            await db.execute("UPDATE users SET is_banned=1, is_approved=0 WHERE user_id=?", (target_uid,))
+            msg_adm = f"🚫 Пользователь {target_uid} забанен."
+            msg_user = "🚫 Вам отказано в доступе."
+        await db.commit()
+    
+    await c.message.edit_text(msg_adm)
+    try: await bot.send_message(target_uid, msg_user)
+    except: pass
     await c.answer()
 
 @router.callback_query(F.data == "adm_tariffs")
@@ -678,7 +698,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 BOT v33.0 FIXED STARTED")
+    logger.info("🚀 BOT v34.0 CLEAN STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
