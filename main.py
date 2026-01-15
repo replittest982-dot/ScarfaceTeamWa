@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = "fast_team_v37.db" 
+DB_NAME = "fast_team_v38.db" 
 
 # Таймеры (минуты)
 AFK_CHECK_MINUTES = 8   
@@ -133,8 +133,11 @@ class UserState(StatesGroup):
     waiting_help_msg = State()
 
 class AdminState(StatesGroup):
+    # Тарифы
     edit_price = State()
+    edit_hold = State()
     edit_time = State()
+    # Другое
     reply_to_user = State()
     bind_tariff = State()
     broadcast_msg = State()
@@ -147,7 +150,7 @@ def main_kb(user_id):
     kb.button(text="📥 Сдать номер", callback_data="sel_tariff")
     kb.button(text="👤 Профиль", callback_data="profile")
     kb.button(text="ℹ️ Помощь", callback_data="help_menu")
-    kb.button(text="🆘 Поддержка", callback_data="ask_support") # Отдельная кнопка
+    kb.button(text="🆘 Поддержка", callback_data="ask_support")
     if user_id == ADMIN_ID:
         kb.button(text="⚡ Админ панель", callback_data="admin_main")
     kb.adjust(1, 2, 1, 1)
@@ -320,9 +323,6 @@ async def cmd_num(m: Message, bot: Bot):
 # ==========================================
 @router.message(Command("sms"))
 async def cmd_sms(m: Message, command: CommandObject, bot: Bot):
-    # Логика: если есть аргументы, берем их. Если нет, чекаем caption.
-    # command.args вернет аргументы из текста или из caption, если они есть после команды.
-    
     raw_args = command.args
     if not raw_args: 
         return await m.reply("⚠️ Пример: <code>/sms +7999... Текст</code>\nМожно с фото.", parse_mode="HTML")
@@ -371,7 +371,49 @@ async def cmd_code(m: Message, command: CommandObject, bot: Bot):
         await m.reply("❌ Ошибка отправки.")
 
 # ==========================================
-# 🏗 ВОРКЕР: КНОПКИ ДЕЙСТВИЙ (С ИСПРАВЛЕНИЯМИ)
+# 📨 МОСТ: ЮЗЕР -> ОФИС (ИСПРАВЛЕНО)
+# ==========================================
+@router.message(F.text | F.photo)
+async def bridge_handler(m: Message, bot: Bot):
+    if m.text and m.text.startswith('/'): return
+    if m.from_user.id == ADMIN_ID: return
+    
+    async with get_db() as db:
+        row = await (await db.execute("SELECT * FROM numbers WHERE user_id=? AND status IN ('work','active')", (m.from_user.id,))).fetchone()
+        
+    if row and row['worker_chat_id']:
+        # Если юзер отвечает на запрос кода - сбрасываем таймер
+        is_code_response = False
+        if row['wait_code_start']:
+            is_code_response = True
+            async with get_db() as db:
+                await db.execute("UPDATE numbers SET wait_code_start=NULL WHERE id=?", (row['id'],))
+                await db.commit()
+        
+        # Формируем сообщение для офиса
+        header = "🔔 <b>КОД / ОТВЕТ ОТ ЮЗЕРА</b>" if is_code_response else f"📩 <b>SMS от юзера ({row['phone']})</b>"
+        txt = f"{header}\n{SEP}\n{m.text if m.text else '[Фото/Файл]'}"
+        
+        try:
+            # Важно: message_thread_id должен быть int или None
+            thread_id = row['worker_thread_id'] if row['worker_thread_id'] else None
+            
+            if m.photo:
+                await bot.send_photo(row['worker_chat_id'], m.photo[-1].file_id, caption=txt, message_thread_id=thread_id, parse_mode="HTML")
+            else:
+                await bot.send_message(row['worker_chat_id'], txt, message_thread_id=thread_id, parse_mode="HTML")
+            
+            await m.react([ReactionTypeEmoji(emoji="⚡")])
+            # Подтверждение юзеру, что ушло
+            if is_code_response:
+                await m.reply("✅ Сообщение передано в офис.")
+                
+        except Exception as e:
+            logger.error(f"Bridge send error: {e}")
+            await m.reply("❌ Ошибка доставки сообщения.")
+
+# ==========================================
+# 🏗 ВОРКЕР: КНОПКИ ДЕЙСТВИЙ
 # ==========================================
 @router.callback_query(F.data.startswith("w_"))
 async def cb_worker_actions(c: CallbackQuery, bot: Bot):
@@ -405,7 +447,7 @@ async def cb_worker_actions(c: CallbackQuery, bot: Bot):
         elif act == "drop":
             await db.execute("UPDATE numbers SET status='finished', end_time=? WHERE id=?", (now, nid))
             dur = calc_duration(row['start_time'], now)
-            hold = row['tariff_hold'] # Берем холд из базы
+            hold = row['tariff_hold'] 
             adm_msg = f"📉 Слет\n⏱ {dur} | ⏳ Холд: {hold}"
             user_msg = f"📉 Ваш номер слетел\nВремя работы: {dur} | Холд тарифа: {hold}"
         
@@ -560,7 +602,7 @@ async def cb_admin_main(c: CallbackQuery):
     kb.adjust(1)
     await c.message.edit_text("⚡ Админ панель", reply_markup=kb.as_markup())
 
-# --- РАССЫЛКА (НОВОЕ) ---
+# --- РАССЫЛКА ---
 @router.callback_query(F.data == "adm_broadcast")
 async def cb_adm_cast(c: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.broadcast_msg)
@@ -605,7 +647,7 @@ async def fsm_adm_reply_send(m: Message, state: FSMContext, bot: Bot):
     except:
         await m.answer("❌ Не доставлено (юзер заблокировал бота).")
 
-# --- ОТЧЕТЫ И ТАРИФЫ ---
+# --- ОТЧЕТЫ ---
 @router.callback_query(F.data == "adm_reports")
 async def cb_adm_reports(c: CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
@@ -635,6 +677,7 @@ async def cb_gen_report(c: CallbackQuery):
     await c.message.answer_document(doc, caption=f"📊 Отчет за {hours}ч")
     await c.answer()
 
+# --- ТАРИФЫ (ИСПРАВЛЕНО - Добавлен ХОЛД) ---
 @router.callback_query(F.data == "adm_edit_tariffs")
 async def cb_adm_tariffs(c: CallbackQuery):
     async with get_db() as db: ts = await (await db.execute("SELECT * FROM tariffs")).fetchall()
@@ -642,7 +685,7 @@ async def cb_adm_tariffs(c: CallbackQuery):
     for t in ts: kb.button(text=f"✏️ {t['name']}", callback_data=f"edt_{t['name']}")
     kb.button(text="🔙 Назад", callback_data="admin_main")
     kb.adjust(1)
-    await c.message.edit_text("🛠 Тарифы:", reply_markup=kb.as_markup())
+    await c.message.edit_text("🛠 Выберите тариф для изменения:", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data.startswith("edt_"))
 async def cb_edit_t_price(c: CallbackQuery, state: FSMContext):
@@ -654,43 +697,28 @@ async def cb_edit_t_price(c: CallbackQuery, state: FSMContext):
 @router.message(AdminState.edit_price)
 async def fsm_t_price(m: Message, state: FSMContext):
     await state.update_data(price=m.text)
-    await state.set_state(AdminState.edit_time)
-    await m.answer("2️⃣ Введите **ВРЕМЯ РАБОТЫ** (например 10:00-22:00):")
+    await state.set_state(AdminState.edit_hold) # Переход к Холду
+    await m.answer("2️⃣ Введите новый **ХОЛД** (например: 20 мин, 1 час):")
+
+@router.message(AdminState.edit_hold)
+async def fsm_t_hold(m: Message, state: FSMContext):
+    await state.update_data(hold=m.text)
+    await state.set_state(AdminState.edit_time) # Переход ко Времени
+    await m.answer("3️⃣ Введите **ВРЕМЯ РАБОТЫ** (например: 10:00-22:00, 24/7):")
 
 @router.message(AdminState.edit_time)
 async def fsm_t_time(m: Message, state: FSMContext):
     data = await state.get_data()
     async with get_db() as db:
-        await db.execute("UPDATE tariffs SET price=?, work_time=? WHERE name=?", (data['price'], m.text, data['target']))
+        await db.execute("UPDATE tariffs SET price=?, hold_time=?, work_time=? WHERE name=?", 
+                         (data['price'], data['hold'], m.text, data['target']))
         await db.commit()
     await state.clear()
-    await m.answer(f"✅ Тариф {data['target']} обновлен!")
-
-# ==========================================
-# 📨 МОСТ (ПЕРЕСЫЛКА СООБЩЕНИЙ)
-# ==========================================
-@router.message(F.text | F.photo)
-async def bridge_handler(m: Message, bot: Bot):
-    if m.text and m.text.startswith('/'): return
-    if m.from_user.id == ADMIN_ID: return
-    
-    async with get_db() as db:
-        row = await (await db.execute("SELECT * FROM numbers WHERE user_id=? AND status IN ('work','active')", (m.from_user.id,))).fetchone()
-        
-    if row and row['worker_chat_id']:
-        if row['wait_code_start']:
-            async with get_db() as db:
-                await db.execute("UPDATE numbers SET wait_code_start=NULL WHERE id=?", (row['id'],))
-                await db.commit()
-        
-        txt = f"📩 <b>Ответ юзера ({row['phone']})</b>:\n{m.text if m.text else '[Вложение]'}"
-        try:
-            if m.photo:
-                await bot.send_photo(row['worker_chat_id'], m.photo[-1].file_id, caption=txt, message_thread_id=row['worker_thread_id'], parse_mode="HTML")
-            else:
-                await bot.send_message(row['worker_chat_id'], txt, message_thread_id=row['worker_thread_id'], parse_mode="HTML")
-            await m.react([ReactionTypeEmoji(emoji="⚡")])
-        except: pass
+    await m.answer(
+        f"✅ Тариф <b>{data['target']}</b> обновлен!\n"
+        f"💰 {data['price']} | ⏳ {data['hold']} | ⏰ {m.text}", 
+        parse_mode="HTML"
+    )
 
 # ==========================================
 # 🔄 МОНИТОРИНГ
@@ -750,7 +778,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 FAST TEAM BOT v37.0 STARTED")
+    logger.info("🚀 FAST TEAM BOT v38.0 FINAL STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
