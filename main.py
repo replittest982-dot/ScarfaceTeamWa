@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_NAME = "fast_team_v38.db" 
+DB_NAME = "fast_team_v39.db" 
 
 # Таймеры (минуты)
 AFK_CHECK_MINUTES = 8   
@@ -529,10 +529,14 @@ async def fsm_receive_numbers(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(report, reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
 
+# ==========================================
+# 👤 ПРОФИЛЬ И МОЯ ОЧЕРЕДЬ (НОВОЕ)
+# ==========================================
 @router.callback_query(F.data == "profile")
 async def cb_profile(c: CallbackQuery):
     uid = c.from_user.id
     async with get_db() as db:
+        # Статистика
         stats = await (await db.execute("""
             SELECT 
                 COUNT(*) as total,
@@ -540,15 +544,51 @@ async def cb_profile(c: CallbackQuery):
                 SUM(CASE WHEN status='queue' THEN 1 ELSE 0 END) as queue
             FROM numbers WHERE user_id=?
         """, (uid,))).fetchone()
-    
+        
+        # Инфо по очереди для пользователя
+        # (Считаем сколько всего людей в очереди перед первым номером юзера)
+        # Упрощение: просто берем кол-во номеров юзера в очереди.
+        user_queue_count = stats['queue'] or 0
+        
+    wait_msg = f"📱 Ваши в очереди: <b>{user_queue_count}</b>"
+    if user_queue_count > 0:
+        # Примерное время: 5 минут на номер (условно)
+        wait_msg += f" (~{user_queue_count * 5} мин ожидания)"
+
     msg = (
         f"👤 <b>Личный кабинет</b>\n{SEP}\n"
         f"🆔 ID: <code>{uid}</code>\n"
         f"📦 Загружено: {stats['total']}\n"
         f"🔥 В работе: {stats['active']}\n"
-        f"⏳ В очереди: {stats['queue']}"
+        f"{wait_msg}"
     )
-    await c.message.edit_text(msg, reply_markup=back_kb(), parse_mode="HTML")
+    
+    kb = InlineKeyboardBuilder()
+    if user_queue_count > 0:
+        kb.button(text="📥 Мои номера", callback_data="my_queue")
+    kb.button(text="🔙 Меню", callback_data="back_main")
+    kb.adjust(1)
+    
+    await c.message.edit_text(msg, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+@router.callback_query(F.data == "my_queue")
+async def cb_my_queue(c: CallbackQuery):
+    uid = c.from_user.id
+    async with get_db() as db:
+        # Берем номера юзера в очереди
+        my_nums = await (await db.execute("SELECT id, phone, tariff_name FROM numbers WHERE user_id=? AND status='queue' ORDER BY id ASC", (uid,))).fetchall()
+        
+        if not my_nums:
+            return await c.answer("📭 Очередь пуста", show_alert=True)
+            
+        txt = f"📥 <b>ВАШИ НОМЕРА В ОЧЕРЕДИ</b>\n{SEP}\n"
+        for row in my_nums:
+            # Считаем реальную позицию в глобальной очереди для каждого номера
+            pos = (await (await db.execute("SELECT COUNT(*) FROM numbers WHERE status='queue' AND id <= ?", (row['id'],))).fetchone())[0]
+            txt += f"<b>{pos}#</b> — {mask_phone(row['phone'], uid)} ({row['tariff_name']})\n"
+            
+    kb = InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="profile")
+    await c.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 # ==========================================
 # ℹ️ ПОМОЩЬ И ПОДДЕРЖКА
@@ -571,6 +611,7 @@ async def cb_help_menu(c: CallbackQuery):
 
 @router.callback_query(F.data == "ask_support")
 async def cb_ask_support(c: CallbackQuery, state: FSMContext):
+    await state.clear() # Сброс старых стейтов
     await state.set_state(UserState.waiting_help_msg)
     kb = InlineKeyboardBuilder().button(text="🔙 Отмена", callback_data="back_main")
     await c.message.edit_text("✍️ Напишите ваш вопрос ниже:", reply_markup=kb.as_markup())
@@ -583,9 +624,13 @@ async def fsm_send_ticket(m: Message, state: FSMContext, bot: Bot):
     
     admin_msg = f"🆘 <b>Новый запрос</b>\nОт: {m.from_user.id} (@{m.from_user.username})\n\n{m.text}"
     try:
-        await bot.send_message(ADMIN_ID, admin_msg, reply_markup=kb.as_markup(), parse_mode="HTML")
-        await m.answer("✅ Сообщение отправлено администрации.", reply_markup=main_kb(m.from_user.id))
-    except:
+        if ADMIN_ID > 0:
+            await bot.send_message(ADMIN_ID, admin_msg, reply_markup=kb.as_markup(), parse_mode="HTML")
+            await m.answer("✅ Сообщение отправлено администрации.", reply_markup=main_kb(m.from_user.id))
+        else:
+            await m.answer("❌ Админ не настроен.")
+    except Exception as e:
+        logger.error(f"Support send error: {e}")
         await m.answer("❌ Ошибка отправки.")
 
 # ==========================================
@@ -605,6 +650,7 @@ async def cb_admin_main(c: CallbackQuery):
 # --- РАССЫЛКА ---
 @router.callback_query(F.data == "adm_broadcast")
 async def cb_adm_cast(c: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.set_state(AdminState.broadcast_msg)
     kb = InlineKeyboardBuilder().button(text="🔙", callback_data="admin_main")
     await c.message.edit_text("📢 Пришлите пост для рассылки (Текст/Фото/Видео):", reply_markup=kb.as_markup())
@@ -677,7 +723,7 @@ async def cb_gen_report(c: CallbackQuery):
     await c.message.answer_document(doc, caption=f"📊 Отчет за {hours}ч")
     await c.answer()
 
-# --- ТАРИФЫ (ИСПРАВЛЕНО - Добавлен ХОЛД) ---
+# --- ТАРИФЫ (ИСПРАВЛЕНО) ---
 @router.callback_query(F.data == "adm_edit_tariffs")
 async def cb_adm_tariffs(c: CallbackQuery):
     async with get_db() as db: ts = await (await db.execute("SELECT * FROM tariffs")).fetchall()
@@ -697,13 +743,13 @@ async def cb_edit_t_price(c: CallbackQuery, state: FSMContext):
 @router.message(AdminState.edit_price)
 async def fsm_t_price(m: Message, state: FSMContext):
     await state.update_data(price=m.text)
-    await state.set_state(AdminState.edit_hold) # Переход к Холду
+    await state.set_state(AdminState.edit_hold)
     await m.answer("2️⃣ Введите новый **ХОЛД** (например: 20 мин, 1 час):")
 
 @router.message(AdminState.edit_hold)
 async def fsm_t_hold(m: Message, state: FSMContext):
     await state.update_data(hold=m.text)
-    await state.set_state(AdminState.edit_time) # Переход ко Времени
+    await state.set_state(AdminState.edit_time)
     await m.answer("3️⃣ Введите **ВРЕМЯ РАБОТЫ** (например: 10:00-22:00, 24/7):")
 
 @router.message(AdminState.edit_time)
@@ -778,7 +824,7 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(monitor(bot))
-    logger.info("🚀 FAST TEAM BOT v38.0 FINAL STARTED")
+    logger.info("🚀 FAST TEAM BOT v39.0 FINAL STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
